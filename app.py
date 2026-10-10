@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import random
 import imaplib
 import email
 from email.header import decode_header
@@ -8,11 +9,11 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- প্রাথমিক মার্চেন্ট কনফিগারেশন ---
+# --- কনফিগারেশন ---
 CONFIG = {
     "GMAIL_USER": "tanmaykundu439@gmail.com",
     "GMAIL_PASS": "cjmjsbslgwdzbfrw",
-    "UPI_ID": "tanmaykundu439@yesfam",  # আপনার নতুন UPI ID
+    "UPI_ID": "tanmaykundu439@yesfam",
     "MERCHANT_NAME": "Fuel Station POS"
 }
 
@@ -29,18 +30,21 @@ def test_gmail_connection():
     except Exception as e:
         return False, f"Gmail Connection Error: {str(e)}"
 
-# --- জিমেইল থেকে পেমেন্ট ভেরিফাই ফাংশন ---
-def verify_payment_mail(order_id, expected_amount):
+# --- জিমেইল থেকে ইউনিক সিক্রেট কোড এবং অ্যামাউন্ট দুটোই মেলানো ---
+def verify_payment_mail(secret_code, expected_amount):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(CONFIG["GMAIL_USER"], CONFIG["GMAIL_PASS"])
         mail.select("inbox")
 
+        # আনরিড ও শেষ ১৫টি ইমেইল সার্চ করবে
         status, messages = mail.search(None, '(UNSEEN)')
         mail_ids = messages[0].split()
         if not mail_ids:
             status, messages = mail.search(None, 'ALL')
-            mail_ids = messages[0].split()[-10:]
+            mail_ids = messages[0].split()[-15:]
+
+        target_code = str(secret_code).strip().lower()
 
         for m_id in reversed(mail_ids):
             status, data = mail.fetch(m_id, '(RFC822)')
@@ -56,29 +60,34 @@ def verify_payment_mail(order_id, expected_amount):
                         body = msg.get_payload(decode=True).decode(errors='ignore')
 
                     body_clean = body.lower()
-                    if "credited" in body_clean or "received" in body_clean or "upi" in body_clean:
-                        amounts = re.findall(r'(?:rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)', body, re.IGNORECASE)
-                        for amt in amounts:
-                            clean_amt = float(amt.replace(',', ''))
-                            if float(expected_amount) == clean_amt:
-                                utr_match = re.search(r'(?:ref(?:\s*no)?|rrn|utr)[:\s]*([0-9]{10,14})', body, re.IGNORECASE)
-                                utr = utr_match.group(1) if utr_match else "UPI-VERIFIED"
-                                mail.logout()
-                                return True, utr
+
+                    # ১. সিক্রেট কোড অবশ্যই ইমেইলের মেসেজে থাকতে হবে
+                    if target_code in body_clean:
+                        # ২. ক্রেডিট হওয়া নিশ্চিত করা
+                        if any(w in body_clean for w in ["credited", "received", "deposited", "upi"]):
+                            amounts = re.findall(r'(?:rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)', body, re.IGNORECASE)
+                            for amt in amounts:
+                                clean_amt = float(amt.replace(',', ''))
+                                # ৩. অ্যামাউন্ট ও কোড দুটোই ম্যাচ করলে তবেই SUCCESS
+                                if float(expected_amount) == clean_amt:
+                                    utr_match = re.search(r'(?:ref(?:\s*no)?|rrn|utr)[:\s]*([0-9]{10,14})', body, re.IGNORECASE)
+                                    utr = utr_match.group(1) if utr_match else "UPI-" + secret_code
+                                    mail.logout()
+                                    return True, utr
 
         mail.logout()
         return False, None
     except Exception as e:
         return False, None
 
-# --- Light Mode Merchant HTML UI ---
+# --- Merchant UI ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="bn">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Merchant UPI Billing Counter</title>
+    <title>Fuel POS Merchant Terminal</title>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <style>
         :root {
@@ -220,7 +229,6 @@ HTML_TEMPLATE = """
             font-size: 15px;
             margin-bottom: 14px;
             outline: none;
-            transition: border-color 0.2s;
         }
 
         input:focus {
@@ -238,21 +246,13 @@ HTML_TEMPLATE = """
             font-weight: 600;
             cursor: pointer;
             width: 100%;
-            transition: background-color 0.2s;
+            transition: 0.2s;
         }
 
-        button:hover {
-            background: var(--primary-hover);
-        }
+        button:hover { background: var(--primary-hover); }
+        button:disabled { background: #94a3b8; cursor: not-allowed; }
 
-        button:disabled {
-            background: #94a3b8;
-            cursor: not-allowed;
-        }
-
-        .qr-display {
-            text-align: center;
-        }
+        .qr-display { text-align: center; }
 
         #qr-box {
             padding: 14px;
@@ -283,6 +283,15 @@ HTML_TEMPLATE = """
             font-size: 17px;
         }
 
+        .code-tag {
+            background: #e0f2fe;
+            color: #0369a1;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-weight: bold;
+        }
+
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.6; }
@@ -301,36 +310,26 @@ HTML_TEMPLATE = """
             border-bottom: 1px solid var(--border-color);
         }
 
-        th {
-            background: #f8fafc;
-            color: var(--text-muted);
-            font-weight: 600;
-        }
-
-        tr:hover {
-            background: #f8fafc;
-        }
+        th { background: #f8fafc; color: var(--text-muted); font-weight: 600; }
+        tr:hover { background: #f8fafc; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <!-- মার্চেন্ট হেডার বার -->
     <div class="header-card">
         <div class="merchant-title">
             <div class="merchant-logo">⛽</div>
             <div>
                 <h2 style="margin: 0; font-size: 20px;">Fuel POS Terminal</h2>
-                <div style="font-size: 13px; color: var(--text-muted); margin-top: 2px;">Smart UPI Auto-Verifier</div>
+                <div style="font-size: 13px; color: var(--text-muted); margin-top: 2px;">Strict Code Verification Engine</div>
             </div>
         </div>
 
         <div class="badge-group">
-            <!-- ডিসকাউন্ট লোগো ব্যাজ -->
             <div class="badge badge-discount">
                 <span>🏷️</span> Instant 0.75% UPI Rebate
             </div>
-            <!-- জিমেইল লাইভ কানেকশন ব্যাজ -->
             <div id="email-status-badge" class="badge badge-offline">
                 <span>●</span> Checking Gmail...
             </div>
@@ -338,19 +337,15 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="grid-layout">
-        <!-- UPI মার্চেন্ট সেটিংস প্যানেল -->
         <div class="card">
             <h3>⚙️ Merchant Configuration</h3>
             <label>Active UPI ID</label>
             <input type="text" id="upi-input" value="{{ config.UPI_ID }}">
-            
-            <label>Merchant / Pump Display Name</label>
+            <label>Merchant / Pump Name</label>
             <input type="text" id="merchant-input" value="{{ config.MERCHANT_NAME }}">
-            
             <button onclick="updateSettings()" style="background: #334155;">Save Settings</button>
         </div>
 
-        <!-- পেমেন্ট কিউআর কাউন্টার -->
         <div class="card qr-display">
             <h3 style="text-align: left;">💳 Generate Dynamic Payment QR</h3>
             
@@ -358,34 +353,37 @@ HTML_TEMPLATE = """
                 <input type="number" id="pay-amount" placeholder="টাকার পরিমাণ লিখুন (যেমন: 500)" min="1">
                 <button id="gen-btn" onclick="generateQR()" disabled>Generate QR Code</button>
                 <div id="lock-msg" style="color: var(--danger); font-size: 13px; margin-top: 10px; display: none;">
-                    ⚠️ Gmail disconnected! QR generation is temporarily locked.
+                    ⚠️ Gmail disconnected! QR generation locked.
                 </div>
             </div>
 
             <div id="payment-view" style="display: none;">
                 <div id="order-info" style="font-weight: bold; color: var(--primary); font-size: 16px;"></div>
+                <div style="margin-top: 6px; font-size: 13px; color: var(--text-muted);">
+                    UPI Bio Code: <span id="secret-code-display" class="code-tag"></span>
+                </div>
                 <div id="qr-box"></div>
-                <div id="payment-status" class="status-pill status-waiting">Waiting for payment email...</div>
+                <div id="payment-status" class="status-pill status-waiting">Waiting for exact bank email...</div>
                 <button onclick="resetQRView()" style="margin-top: 15px; background: #64748b;">New Bill</button>
             </div>
         </div>
     </div>
 
-    <!-- পেমেন্ট হিস্ট্রি -->
     <div class="card">
         <h3>📋 Live Transaction History</h3>
-        <table id="history-table">
+        <table>
             <thead>
                 <tr>
                     <th>Order ID</th>
+                    <th>Code</th>
                     <th>Amount</th>
                     <th>Status</th>
-                    <th>UTR / Ref No</th>
+                    <th>UTR / Ref</th>
                     <th>Time</th>
                 </tr>
             </thead>
             <tbody id="history-body">
-                <tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 20px;">No transactions recorded yet</td></tr>
+                <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">No verified transactions yet</td></tr>
             </tbody>
         </table>
     </div>
@@ -430,14 +428,12 @@ HTML_TEMPLATE = """
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ upi_id: upi, merchant_name: name })
-        }).then(res => res.json()).then(data => {
-            alert(data.message);
-        });
+        }).then(res => res.json()).then(data => alert(data.message));
     }
 
     function generateQR() {
         const amt = document.getElementById('pay-amount').value;
-        if (!amt || amt <= 0) return alert('দয়া করে সঠিক অ্যামাউন্ট লিখুন!');
+        if (!amt || amt <= 0) return alert('সঠিক অ্যামাউন্ট লিখুন!');
 
         fetch(`/api/create_order?amount=${amt}`)
             .then(res => res.json())
@@ -445,7 +441,8 @@ HTML_TEMPLATE = """
                 currentOrderId = data.order_id;
                 document.getElementById('create-view').style.display = 'none';
                 document.getElementById('payment-view').style.display = 'block';
-                document.getElementById('order-info').innerText = `Order: ${data.order_id} | Total: ₹${amt}`;
+                document.getElementById('order-info').innerText = `Total: ₹${amt}`;
+                document.getElementById('secret-code-display').innerText = data.secret_code;
 
                 document.getElementById('qr-box').innerHTML = '';
                 new QRCode(document.getElementById('qr-box'), {
@@ -454,22 +451,22 @@ HTML_TEMPLATE = """
                     height: 200
                 });
 
-                startPolling(currentOrderId, amt);
+                startPolling(currentOrderId, data.secret_code, amt);
             });
     }
 
-    function startPolling(orderId, amt) {
+    function startPolling(orderId, secretCode, amt) {
         if (pollInterval) clearInterval(pollInterval);
 
         pollInterval = setInterval(() => {
-            fetch(`/api/verify_order?order_id=${orderId}&amount=${amt}`)
+            fetch(`/api/verify_order?order_id=${orderId}&secret_code=${secretCode}&amount=${amt}`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.status === 'success') {
                         clearInterval(pollInterval);
                         const statusBox = document.getElementById('payment-status');
                         statusBox.className = 'status-pill status-success';
-                        statusBox.innerHTML = `✅ Payment Received (UTR: ${data.utr})`;
+                        statusBox.innerHTML = `✅ Payment Verified (UTR: ${data.utr})`;
                         loadHistory();
                     }
                 });
@@ -485,6 +482,7 @@ HTML_TEMPLATE = """
                 tbody.innerHTML = list.map(item => `
                     <tr>
                         <td><strong>${item.order_id}</strong></td>
+                        <td><span class="code-tag">${item.secret_code}</span></td>
                         <td>₹${item.amount}</td>
                         <td><span style="color: var(--success); font-weight: 700;">${item.status}</span></td>
                         <td>${item.utr}</td>
@@ -499,7 +497,7 @@ HTML_TEMPLATE = """
         document.getElementById('create-view').style.display = 'block';
         document.getElementById('payment-view').style.display = 'none';
         document.getElementById('payment-status').className = 'status-pill status-waiting';
-        document.getElementById('payment-status').innerText = 'Waiting for payment email...';
+        document.getElementById('payment-status').innerText = 'Waiting for exact bank email...';
     }
 
     checkEmailStatus();
@@ -535,31 +533,48 @@ def api_create_order():
         return jsonify({"status": "error", "message": "Gmail is disconnected"}), 400
 
     amt = request.args.get('amount', '0')
-    order_id = "FP" + uuid.uuid4().hex[:6].upper()
-    upi_url = f"upi://pay?pa={CONFIG['UPI_ID']}&pn={CONFIG['MERCHANT_NAME']}&am={amt}&cu=INR&tr={order_id}"
+    # র্যান্ডম সিক্রেট কোড তৈরি (যেমন: FP8472) যা UPI নোটে পাঠানো হবে
+    secret_code = "FP" + str(random.randint(1000, 9999))
+    order_id = "ORD" + uuid.uuid4().hex[:6].upper()
+
+    # tn (Transaction Note / Bio) হিসেবে secret_code যুক্ত করা
+    upi_url = f"upi://pay?pa={CONFIG['UPI_ID']}&pn={CONFIG['MERCHANT_NAME']}&am={amt}&cu=INR&tn={secret_code}&tr={secret_code}"
     
-    ACTIVE_ORDERS[order_id] = {"amount": amt, "status": "PENDING"}
-    return jsonify({"order_id": order_id, "amount": amt, "upi_url": upi_url})
+    ACTIVE_ORDERS[order_id] = {
+        "amount": amt,
+        "secret_code": secret_code,
+        "status": "PENDING"
+    }
+    return jsonify({
+        "order_id": order_id,
+        "secret_code": secret_code,
+        "amount": amt,
+        "upi_url": upi_url
+    })
 
 @app.route('/api/verify_order')
 def api_verify_order():
     order_id = request.args.get('order_id')
+    secret_code = request.args.get('secret_code')
     amount = request.args.get('amount')
 
     if order_id in ACTIVE_ORDERS and ACTIVE_ORDERS[order_id]["status"] == "SUCCESS":
         return jsonify({"status": "success", "utr": ACTIVE_ORDERS[order_id]["utr"]})
 
-    verified, utr = verify_payment_mail(order_id, amount)
+    # কোড ও অ্যামাউন্ট উভয়টি ইমেইলে যাচাই
+    verified, utr = verify_payment_mail(secret_code, amount)
     if verified:
         import datetime
         record = {
             "order_id": order_id,
+            "secret_code": secret_code,
             "amount": amount,
             "status": "SUCCESS",
             "utr": utr,
             "time": datetime.datetime.now().strftime("%I:%M:%S %p")
         }
-        ACTIVE_ORDERS[order_id] = record
+        ACTIVE_ORDERS[order_id]["status"] = "SUCCESS"
+        ACTIVE_ORDERS[order_id]["utr"] = utr
         PAYMENT_HISTORY.append(record)
         return jsonify({"status": "success", "utr": utr})
     
