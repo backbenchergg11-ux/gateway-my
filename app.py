@@ -20,7 +20,7 @@ app = Flask(__name__)
 CONFIG = {
     "GMAIL_USER": "tanmaykundu439@gmail.com",
     "GMAIL_PASS": "cjmjsbslgwdzbfrw",
-    "UPI_ID": "tanmaykundu439@yesfam",
+    "UPI_ID": "verifiedtanmay@fam",
     "MERCHANT_NAME": "BN Enterprises",
     "REBATE_PERCENT": 0.75
 }
