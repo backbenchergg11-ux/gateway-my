@@ -20,18 +20,22 @@ app = Flask(__name__)
 CONFIG = {
     "GMAIL_USER": "tanmaykundu439@gmail.com",
     "GMAIL_PASS": "cjmjsbslgwdzbfrw",
-    "UPI_ID": "verifiedtanmay@fam",
+    "UPI_ID": "tanmaykundu439@yesfam",
     "MERCHANT_NAME": "BN Enterprises",
-    "REBATE_PERCENT": 0.75
+    "REBATE_PERCENT": 0.75,
+    "STRICT_CODE": False    # 🔓 False = Relaxed mode (কোড না থাকলেও amount+time মিললে verify)
 }
 
 PAYMENT_HISTORY = []
 ACTIVE_ORDERS = {}
 USED_UTRS = set()
+USED_EMAIL_IDS = set()      # একই ইমেইল দুই অর্ডারে ব্যবহার ঠেকাতে
+DEBUG_LOG = []              # verify fail-এর কারণ লগ
 
-ORDER_TIMEOUT = 300          # ৫ মিনিট পরে order expire
-EMAIL_CACHE_TTL = 4          # Gmail কল থ্রটল (সেকেন্ড)
-EMAIL_LOOKBACK_MIN = 20      # শেষ ২০ মিনিটের মেইল ভেরিফাই হবে
+ORDER_TIMEOUT = 300
+EMAIL_CACHE_TTL = 4
+EMAIL_LOOKBACK_MIN = 30
+EMAIL_FETCH_COUNT = 30
 HISTORY_FILE = "payment_history.json"
 
 _gmail_lock = threading.Lock()
@@ -39,7 +43,15 @@ _email_cache = []
 _last_fetch = 0
 _conn_cache = {"ok": False, "msg": "Not checked yet", "ts": 0}
 
-# ================= হিস্টোরি সেভ / লোড (Restart-proof) =================
+def _log_debug(order_id, reason):
+    DEBUG_LOG.append({
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "order_id": order_id,
+        "reason": reason
+    })
+    del DEBUG_LOG[:-30]
+
+# ================= হিস্টোরি সেভ / লোড =================
 def save_history():
     try:
         with open(HISTORY_FILE, "w") as f:
@@ -57,12 +69,13 @@ def load_history():
                 t.setdefault("status", "SUCCESS")
                 t.setdefault("payer", None)
                 t.setdefault("date", "")
+                t.setdefault("manual", False)
     except Exception:
         pass
 
 load_history()
 
-# ================= Gmail কানেকশন (থ্রটল সহ) =================
+# ================= Gmail কানেকশন =================
 def test_gmail_connection():
     now = time.time()
     if now - _conn_cache["ts"] < 20:
@@ -76,7 +89,7 @@ def test_gmail_connection():
         _conn_cache.update(ok=False, msg=f"Gmail Error: {str(e)}", ts=now)
     return _conn_cache["ok"], _conn_cache["msg"]
 
-# ================= ইমেইল বডি পার্সার (HTML সাপোর্ট সহ) =================
+# ================= ইমেইল বডি পার্সার =================
 def _parse_body(msg):
     body = ""
     if msg.is_multipart():
@@ -105,31 +118,23 @@ def _parse_body(msg):
 # ================= Payer Name Extractor (FamPay + সব ব্যাংক) =================
 def extract_payer_name(subject, body):
     text = re.sub(r"\s+", " ", f"{subject} {body}")
-    text = text.replace("*", " ").replace("#", " ").replace("_", " ")  # FamPay-র bold ** চিহ্ন বাদ
+    text = text.replace("*", " ").replace("#", " ").replace("_", " ")
 
-    # নামের পরে এসব শব্দ এলে নাম ওখানেই শেষ
     STOP = (r"(?=\s*(?:\(|\[|\bvia\b|\bref\b|\butr\b|\brrn\b|\btid\b|\btxn\b|\bid\b|\bno\b|\bon\b|"
             r"\btowards\b|\bfor\b|\bfrom\b|\bwith\b|\byour\b|\bupi\b|\bacc\b|\baccount\b|\ba/c\b|"
             r"\bbank\b|\bto\b|\bbalance\b|\bwallet\b|[,.\-|!?:;]|\d|$))")
 
     patterns = [
-        # 🟣 FamPay: "You've received ₹500 from AARAV SHARMA"
         rf"(?:received|got|credited(?:\s+with)?)\s*(?:₹|rs\.?|inr)?\s*[\d,]+(?:\.\d{{1,2}})?\s*"
         rf"(?:from|by)\s+((?:mr\.?|mrs\.?|ms\.?|md\.?)?\s*[A-Za-z][A-Za-z\s\.']{{1,39}}?){STOP}",
-        # 🟣 FamPay: "AARAV SHARMA sent you money"
         rf"([A-Za-z][A-Za-z\s\.']{{1,39}}?)\s+sent\s+you{STOP}",
-        # 🟣 FamPay: "₹500 received from AARAV"
         rf"(?:₹|rs\.?|inr)\s*[\d,]+(?:\.\d{{1,2}})?\s*(?:received|credited)\s*from\s+"
         rf"([A-Za-z][A-Za-z\s\.']{{1,39}}?){STOP}",
-        # 🏦 সাধারণ: "credited ... from NAME"
         rf"from\s+((?:mr\.?|mrs\.?|ms\.?|md\.?)?\s*[A-Za-z][A-Za-z\s\.']{{1,39}}?){STOP}",
-        # 🏦 "Payer Name: XYZ" / "Sender Name: XYZ"
         r"(?:payer|sender|customer|remitter|beneficiary)\s*name\s*[:\-]\s*([A-Za-z][A-Za-z\s\.']{2,39})",
-        # 🏦 "IMPS/Payment by NAME"
         rf"(?:payment|paid|transfer(?:red)?)\s+by\s+([A-Za-z][A-Za-z\s\.']{{1,39}}?){STOP}",
     ]
 
-    # নাম নয় এমন প্রথম শব্দ
     not_name_words = {
         "upi", "ref", "inr", "rs", "your", "the", "this", "a/c", "ac", "bank", "http", "www",
         "you", "yours", "dear", "hey", "hi", "hello", "fam", "fampay", "fampay!", "noreply",
@@ -142,18 +147,18 @@ def extract_payer_name(subject, body):
         if m:
             name = m.group(1).strip(" .,|-_'\"")
             name = re.sub(r"\s+", " ", name)
-            if name.isupper():          # "AARAV SHARMA" → "Aarav Sharma"
+            if name.isupper():
                 name = name.title()
             first_word = name.split()[0].lower() if name else ""
             if (len(name) >= 3
                     and first_word not in not_name_words
                     and not name.isdigit()
-                    and not name.upper().startswith("FP")   # FP কোড নাম নয়
+                    and not name.upper().startswith("FP")
                     and "@" not in name):
                 return name
     return None
 
-# ================= রিসেন্ট মেইল ক্যাশ (Rate-limit protection) =================
+# ================= রিসেন্ট মেইল ক্যাশ =================
 def get_recent_emails():
     global _email_cache, _last_fetch
     with _gmail_lock:
@@ -166,7 +171,7 @@ def get_recent_emails():
             mail.select("inbox")
             since = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
             _, messages = mail.search(None, f'(SINCE "{since}")')
-            ids = messages[0].split()[-20:]
+            ids = messages[0].split()[-EMAIL_FETCH_COUNT:]
             parsed = []
             for m_id in reversed(ids):
                 _, data = mail.fetch(m_id, "(RFC822)")
@@ -203,36 +208,84 @@ def _is_recent_mail(msg):
     except Exception:
         return True
 
-# ================= পেমেন্ট ভেরিফিকেশন (কোড + অ্যামাউন্ট + Payer Name) =================
-def verify_payment_mail(secret_code, expected_amount):
+# ================= পেমেন্ট ভেরিফিকেশন (Hybrid: Strict + Relaxed) =================
+def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=True):
     emails = get_recent_emails()
     target = str(secret_code).strip().lower()
     expected = round(float(expected_amount), 2)
 
+    if not emails:
+        return False, None, None, "no_emails"
+
+    last_reason = "no_match"
+
     for msg, subject, body in emails:
         if not _is_recent_mail(msg):
             continue
-        low = body.lower()
-        if target not in low and target not in subject.lower():
+
+        # এই ইমেইল আগে অন্য অর্ডারে ব্যবহৃত হলে বাদ
+        try:
+            mid = (msg.get("Message-ID") or (subject + str(msg.get("Date")))).strip()
+        except Exception:
+            mid = subject + str(msg.get("Date"))
+        if mid in USED_EMAIL_IDS:
+            last_reason = "email_used"
             continue
-        if not any(w in low for w in ["credited", "received", "deposited", "upi"]):
+
+        # ইমেইল অর্ডার তৈরির আগের হলে বাদ (পুরনো পেমেন্ট ম্যাচ ঠেকাতে)
+        if created_at is not None:
+            try:
+                dt = parsedate_to_datetime(msg.get("Date"))
+                if dt and dt.timestamp() < (created_at - 120):
+                    last_reason = "too_old"
+                    continue
+            except Exception:
+                pass
+
+        text = f"{subject} {body}"
+        low = text.lower()
+
+        # Debit মেইল বাদ
+        if "debited" in low and "credited" not in low and "received" not in low:
             continue
-        amounts = re.findall(r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)", body, re.IGNORECASE)
+
+        if not any(w in low for w in ["credited", "received", "deposited", "added", "upi"]):
+            continue
+
+        code_found = target in low
+
+        # Amount match খুঁজি
+        amounts = re.findall(r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)", text, re.IGNORECASE)
+        amount_match = False
         for a in amounts:
             try:
                 val = float(a.replace(",", ""))
             except ValueError:
                 continue
             if abs(expected - val) < 0.01:
-                m = re.search(
-                    r"(?:ref(?:\s*(?:no|number)?)?|rrn|utr|upi\s*ref)[:\s./]*([0-9]{10,14})",
-                    body, re.IGNORECASE)
-                utr = m.group(1) if m else "UPI-" + secret_code
-                payer = extract_payer_name(subject, body)
-                return True, utr, payer
-    return False, None, None
+                amount_match = True
+                break
 
-# ================= Expired অর্ডার → History-তে যাবে =================
+        if not amount_match:
+            last_reason = "no_amount_match"
+            continue
+
+        # Strict mode-এ কোড বাধ্যতামূলক; Relaxed mode-এ amount+time যথেষ্ট
+        if strict and not code_found:
+            last_reason = "no_code_match"
+            continue
+
+        m = re.search(
+            r"(?:ref(?:\s*(?:no|number)?)?|rrn|utr|upi\s*ref)[:\s./]*([0-9]{10,14})",
+            text, re.IGNORECASE)
+        utr = m.group(1) if m else ("UPI-" + secret_code)
+        payer = extract_payer_name(subject, body)
+        USED_EMAIL_IDS.add(mid)
+        return True, utr, payer, "matched"
+
+    return False, None, None, last_reason
+
+# ================= Expired অর্ডার → History =================
 def cleanup_expired_orders():
     now = time.time()
     changed = False
@@ -246,6 +299,7 @@ def cleanup_expired_orders():
                 "status": "EXPIRED",
                 "payer": None,
                 "utr": "—",
+                "manual": False,
                 "time": datetime.datetime.now().strftime("%I:%M:%S %p"),
                 "date": datetime.datetime.now().strftime("%Y-%m-%d")
             }
@@ -255,7 +309,7 @@ def cleanup_expired_orders():
     if changed:
         save_history()
 
-# ================= Merchant UI (BN Enterprises) =================
+# ================= Merchant UI =================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="bn">
@@ -264,6 +318,8 @@ HTML_TEMPLATE = """
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BN Enterprises - Fuel POS Terminal</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
 *{box-sizing:border-box}
 :root{--bg:#f1f5f9;--card:#fff;--primary:#2563eb;--primary-dark:#1d4ed8;--success:#16a34a;--danger:#dc2626;--text:#0f172a;--muted:#64748b;--border:#e2e8f0}
@@ -295,7 +351,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 
 h3{margin:0 0 16px;font-size:17px}
 label{font-size:13px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px}
-input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:#f8fafc;font-size:15px;margin-bottom:14px;outline:none;transition:.2s}
+input[type=text],input[type=number]{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:#f8fafc;font-size:15px;margin-bottom:14px;outline:none;transition:.2s}
 input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
 .btn{background:var(--primary);color:#fff;border:none;padding:13px 20px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;width:100%;transition:.2s}
 .btn:hover{background:var(--primary-dark);transform:translateY(-1px)}
@@ -303,6 +359,7 @@ input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgb
 .btn.gray{background:#64748b;margin-top:12px}
 .btn.red{background:var(--danger);margin-top:12px}
 .btn.dark{background:#334155}
+.btn.orange{background:#d97706}
 .btn.small{width:auto;padding:9px 16px;font-size:13px}
 
 .quick-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
@@ -329,7 +386,6 @@ input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgb
 .checkmark circle{stroke:var(--success);stroke-width:3;fill:none;stroke-dasharray:166;stroke-dashoffset:166;animation:drawStroke .6s cubic-bezier(.65,0,.45,1) forwards}
 .checkmark path{stroke:var(--success);stroke-width:4;fill:none;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:48;stroke-dashoffset:48;animation:drawStroke .35s .55s cubic-bezier(.65,0,.45,1) forwards}
 
-/* 🙏 Thank You Card */
 .thank-card{text-align:center;background:linear-gradient(135deg,#ecfdf5,#d1fae5);border:1px solid #a7f3d0;border-radius:16px;padding:18px 14px;margin:14px 0 10px;animation:fadeInUp .5s ease}
 .thank-title{font-size:13px;color:#059669;font-weight:800;letter-spacing:1px}
 .thank-name{font-size:28px;font-weight:900;color:#065f46;margin:4px 0;animation:namePop .8s cubic-bezier(.34,1.56,.64,1);word-break:break-word}
@@ -341,7 +397,6 @@ input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgb
 .thank-time{font-size:13px;color:var(--muted);font-weight:600;margin-top:4px}
 @keyframes namePop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
 
-/* 🖥️ Fullscreen Customer Display */
 .cust-display{position:fixed;inset:0;background:linear-gradient(-45deg,#064e3b,#059669,#10b981,#047857);background-size:400% 400%;animation:gradientShift 8s ease infinite;z-index:9999;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#fff;padding:24px;cursor:pointer}
 .cust-display.open{display:flex}
 .cd-logo{font-size:20px;font-weight:800;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);padding:10px 24px;border-radius:9999px}
@@ -402,9 +457,13 @@ tbody tr:hover{background:#f8fafc}
 .r-row{display:flex;justify-content:space-between;font-size:13.5px;margin:7px 0;gap:10px}
 .r-total{display:flex;justify-content:space-between;font-size:18px;font-weight:800;margin:10px 0}
 .r-green{color:var(--success)}
-.modal-actions{display:flex;gap:10px;margin-top:16px;justify-content:center}
+.modal-actions{display:flex;gap:8px;margin-top:16px;justify-content:center;flex-wrap:wrap}
 
 .confetti{position:fixed;top:-12px;z-index:9999;pointer-events:none}
+#dl-overlay{position:fixed;inset:0;background:rgba(15,23,42,.75);z-index:10001;display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px;color:#fff}
+#dl-overlay.open{display:flex}
+.spinner{width:44px;height:44px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
 @keyframes fadeInUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
 @keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
@@ -427,7 +486,7 @@ tbody tr:hover{background:#f8fafc}
       <div class="merchant-logo">⛽</div>
       <div>
         <h2 style="margin:0;font-size:20px;" id="hdr-merchant">{{ config.MERCHANT_NAME }}</h2>
-        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">UPI Auto-Verify Engine v3.0</div>
+        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">UPI Auto-Verify Engine v3.2</div>
       </div>
     </div>
     <div class="badge-group">
@@ -450,9 +509,14 @@ tbody tr:hover{background:#f8fafc}
         <input type="text" id="upi-input" value="{{ config.UPI_ID }}">
         <label>Merchant / Pump Name</label>
         <input type="text" id="merchant-input" value="{{ config.MERCHANT_NAME }}">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--text);margin:2px 0 14px;cursor:pointer">
+          <input type="checkbox" id="strict-toggle" {{ 'checked' if config.STRICT_CODE else '' }} style="width:auto;margin:0;accent-color:var(--primary)">
+          🔐 Strict Mode — ইমেইলে FP কোড থাকতেই হবে
+        </label>
         <button class="btn dark" onclick="updateSettings()">💾 Save Settings</button>
         <div style="margin-top:16px;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12.5px;color:var(--muted);line-height:1.6">
-          ℹ️ কাস্টমার QR স্ক্যান করলে UPI নোটে <b style="color:var(--primary)">FP-code</b> অটো যুক্ত হবে। পেমেন্ট হলে Gmail-এ ব্যাংকের মেইলে <b>কোড + অ্যামাউন্ট + কাস্টমারের নাম</b> অটো-ডিটেক্ট হবে।
+          ℹ️ <b>Relaxed Mode (default):</b> ইমেইলে কোড না থাকলেও — অর্ডার তৈরির <b>পরে</b> আসা ইমেইলে অ্যামাউন্ট মিললেই verify হবে।<br>
+          ℹ️ ইমেইল verify না হলে <b>Manual Verify</b> বাটন ব্যবহার করুন।
         </div>
       </div>
 
@@ -477,8 +541,10 @@ tbody tr:hover{background:#f8fafc}
             <div class="rebate-hint">🎁 কাস্টমার পাবে {{ config.REBATE_PERCENT }}% ইনস্ট্যান্ট রিবেট</div>
             <div id="qr-box"></div>
             <div id="payment-status" class="status-pill status-waiting"><span class="dots"><span></span><span></span><span></span></span> ব্যাংক কনফার্মেশনের অপেক্ষায়...</div>
+            <div id="verify-hint" style="font-size:12px;color:var(--muted);margin-top:8px;min-height:16px;text-align:center"></div>
             <div class="timer-wrap"><div id="timer-bar"></div></div>
             <div id="timer-text">Expires in 05:00</div>
+            <button class="btn" style="background:#d97706;margin-top:10px" onclick="manualVerify()">✋ Manual Verify (Email Verify না হলে)</button>
             <button class="btn red" onclick="cancelOrder()">✖ Cancel Order</button>
           </div>
 
@@ -500,7 +566,7 @@ tbody tr:hover{background:#f8fafc}
             <div id="success-details"></div>
 
             <button class="btn" style="background:var(--success)" onclick="openCustomerDisplay()">🖥️ Customer Display (Full Screen)</button>
-            <button class="btn" onclick="showReceipt(lastRecord)">🧾 View Receipt</button>
+            <button class="btn" onclick="showReceipt(lastRecord)">🧾 View / Download Receipt</button>
             <button class="btn gray" onclick="resetQRView()">➕ New Bill</button>
           </div>
         </div>
@@ -550,7 +616,6 @@ tbody tr:hover{background:#f8fafc}
   </section>
 </div>
 
-<!-- 🖥️ Fullscreen Customer Display -->
 <div id="cust-display" class="cust-display" onclick="closeCustomerDisplay()">
   <div class="cd-logo">⛽ <span id="cd-merchant">BN Enterprises</span></div>
   <div class="cd-check">✅</div>
@@ -583,23 +648,37 @@ tbody tr:hover{background:#f8fafc}
       <div class="r-sub">ধন্যবাদ! আবার আসবেন 🙏</div>
     </div>
     <div class="modal-actions">
-      <button class="btn small" style="background:var(--success)" onclick="window.print()">🖨️ Print</button>
+      <button class="btn small" style="background:var(--success)" onclick="downloadReceipt('png')">⬇️ Download PNG</button>
+      <button class="btn small orange" onclick="downloadReceipt('pdf')">⬇️ Download PDF</button>
+      <button class="btn small dark" onclick="window.print()">🖨️ Print</button>
       <button class="btn small" style="background:#64748b" onclick="closeReceipt()">Close</button>
     </div>
   </div>
 </div>
 
+<div id="dl-overlay">
+  <div class="spinner"></div>
+  <div id="dl-text" style="font-weight:700;font-size:15px">Receipt তৈরি হচ্ছে...</div>
+</div>
+
 <div id="toast-wrap"></div>
 
 <script>
-let pollTimer=null, timerInt=null, timeLeft=300, lastRecord=null, historyData=[], gmailOK=false, currentOrderId=null, statusFilter='ALL', cdTimer=null;
+let pollTimer=null, timerInt=null, timeLeft=300, lastRecord=null, historyData=[], gmailOK=false, currentOrderId=null, statusFilter='ALL', cdTimer=null, currentReceiptRec=null;
 const el = id => document.getElementById(id);
 
-/* ---- Live Clock ---- */
+const REASONS={
+  no_emails:'কোনো নতুন ইমেইল পাওয়া যায়নি — Gmail-এ FamPay/ব্যাংকের মেইল এসেছে কিনা দেখুন',
+  no_code_match:'ইমেইলে FP কোড পাওয়া যায়নি — Settings-এ Strict Mode বন্ধ করুন',
+  no_amount_match:'অ্যামাউন্ট ম্যাচ হয়নি এখনো',
+  email_used:'ইমেইল অন্য অর্ডারে ব্যবহৃত হয়েছে',
+  too_old:'ইমেইলটি অর্ডারের আগের — বাদ',
+  no_match:'অপেক্ষা চলছে...'
+};
+
 function updateClock(){ el('clock').innerText = new Date().toLocaleTimeString('en-IN',{hour12:true}); }
 setInterval(updateClock,1000); updateClock();
 
-/* ---- Tabs ---- */
 function switchTab(name){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(s=>s.classList.remove('active'));
@@ -609,7 +688,6 @@ function switchTab(name){
 }
 function refreshDashboard(){ loadStats(); loadHistory(); }
 
-/* ---- Toast ---- */
 function showToast(msg,type='success'){
   const t=document.createElement('div');
   t.className='toast '+type; t.innerText=msg;
@@ -618,7 +696,6 @@ function showToast(msg,type='success'){
   setTimeout(()=>{t.classList.remove('show'); setTimeout(()=>t.remove(),400);},3200);
 }
 
-/* ---- Gmail Status ---- */
 function checkEmailStatus(){
   fetch('/api/check_email_status').then(r=>r.json()).then(d=>{
     gmailOK = d.connected;
@@ -637,17 +714,15 @@ function checkEmailStatus(){
 }
 setInterval(checkEmailStatus,30000);
 
-/* ---- Settings ---- */
 function updateSettings(){
   fetch('/api/update_settings',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({upi_id:el('upi-input').value,merchant_name:el('merchant-input').value})})
+    body:JSON.stringify({upi_id:el('upi-input').value,merchant_name:el('merchant-input').value,strict:el('strict-toggle').checked})})
   .then(r=>r.json()).then(d=>{
     el('hdr-merchant').innerText=el('merchant-input').value;
     showToast(d.message,'success');
   }).catch(()=>showToast('Save failed!','error'));
 }
 
-/* ---- QR Generation ---- */
 function setAmount(v){ el('pay-amount').value=v; validateAmount(); }
 function validateAmount(){
   const v=parseFloat(el('pay-amount').value);
@@ -667,6 +742,7 @@ function generateQR(){
       el('order-info').innerText=`Total: ₹${Number(d.amount).toFixed(2)}`;
       el('secret-code-display').innerText=d.secret_code;
       el('qr-box').innerHTML='';
+      el('verify-hint').innerText='';
       el('payment-status').className='status-pill status-waiting';
       el('payment-status').innerHTML='<span class="dots"><span></span><span></span><span></span></span> ব্যাংক কনফার্মেশনের অপেক্ষায়...';
       new QRCode(el('qr-box'),{text:d.upi_url,width:200,height:200,correctLevel:QRCode.CorrectLevel.M});
@@ -674,16 +750,21 @@ function generateQR(){
     }).catch(()=>showToast('Order create failed!','error'));
 }
 
-/* ---- Polling + Timer ---- */
 function startPolling(orderId){
   stopPolling();
   timeLeft=300; updateTimer();
+  const waitStart=Date.now();
   timerInt=setInterval(()=>{ timeLeft--; updateTimer(); if(timeLeft<=0){ stopPolling(); showExpired(); } },1000);
   pollTimer=setInterval(()=>{
     fetch(`/api/verify_order?order_id=${orderId}`).then(r=>r.json()).then(d=>{
-      if(d.status==='success') onVerified(d.record);
+      if(d.status==='success'){ el('verify-hint').innerText=''; onVerified(d.record); }
       else if(d.status==='expired'){ stopPolling(); showExpired(); }
       else if(d.status==='cancelled'){ stopPolling(); resetQRView(); }
+      else {
+        if(Date.now()-waitStart>12000 && d.reason){
+          el('verify-hint').innerText='ℹ️ '+(REASONS[d.reason]||'অপেক্ষা চলছে...');
+        }
+      }
     }).catch(()=>{});
   },2500);
 }
@@ -701,7 +782,6 @@ function showExpired(){
   st.innerText='⏰ Order expired! Dashboard-এ EXPIRED হিসেবে দেখা যাবে।';
 }
 
-/* ---- Cancel Order → Dashboard-এ যাবে ---- */
 function cancelOrder(){
   if(!currentOrderId){ resetQRView(); return; }
   fetch(`/api/cancel_order?order_id=${currentOrderId}`)
@@ -712,7 +792,17 @@ function cancelOrder(){
     }).catch(()=>showToast('Cancel failed!','error'));
 }
 
-/* ---- Success: Thank @Name + Amount Count-up + Time ---- */
+/* ---- ✋ Manual Verify (Email verify fail হলে) ---- */
+function manualVerify(){
+  if(!currentOrderId) return;
+  if(!confirm('Manual verify করলে ইমেইল যাচাই ছাড়াই এই অর্ডার SUCCESS হবে। নিশ্চিত?')) return;
+  fetch(`/api/manual_verify?order_id=${currentOrderId}`)
+    .then(r=>r.json()).then(d=>{
+      if(d.status==='success'){ onVerified(d.record); }
+      else showToast(d.message||'Manual verify failed','error');
+    }).catch(()=>showToast('Manual verify failed','error'));
+}
+
 function onVerified(rec){
   stopPolling(); lastRecord=rec;
   el('pay-active').style.display='none';
@@ -721,9 +811,9 @@ function onVerified(rec){
   const payer = rec.payer || 'Customer';
   const amt = Number(rec.amount);
 
-  el('thank-name').innerText = payer;                        // 🙏 Thank @name
-  countUp(el('thank-amount'), amt);                          // 💰 Amount count-up
-  el('thank-time').innerText = rec.time || new Date().toLocaleTimeString('en-IN',{hour12:true}); // 🕐 Time
+  el('thank-name').innerText = payer;
+  countUp(el('thank-amount'), amt);
+  el('thank-time').innerText = rec.time || new Date().toLocaleTimeString('en-IN',{hour12:true});
 
   const rebate=(amt*0.75/100).toFixed(2);
   el('success-details').innerHTML=`
@@ -733,7 +823,6 @@ function onVerified(rec){
   playSuccessSound(); launchConfetti(); blinkTitle();
   loadStats(); loadHistory();
 
-  // 🖥️ ১.৫ সেকেন্ড পরে অটো Fullscreen Customer Display খুলবে
   setTimeout(()=>openCustomerDisplay(payer, amt, rec.time), 1500);
 }
 
@@ -747,7 +836,6 @@ function countUp(elm,target){
   requestAnimationFrame(step);
 }
 
-/* ---- 🖥️ Fullscreen Customer Display ---- */
 function openCustomerDisplay(payer, amt, time){
   if(lastRecord){
     payer = payer || lastRecord.payer || 'Customer';
@@ -761,14 +849,13 @@ function openCustomerDisplay(payer, amt, time){
   el('cust-display').classList.add('open');
   playSuccessSound();
   if(cdTimer) clearTimeout(cdTimer);
-  cdTimer=setTimeout(closeCustomerDisplay, 15000);   // ১৫ সেকেন্ড পরে অটো-বন্ধ
+  cdTimer=setTimeout(closeCustomerDisplay, 15000);
 }
 function closeCustomerDisplay(){
   el('cust-display').classList.remove('open');
   if(cdTimer){ clearTimeout(cdTimer); cdTimer=null; }
 }
 
-/* ---- Success Effects ---- */
 function blinkTitle(){
   let n=0;
   const t=setInterval(()=>{
@@ -807,10 +894,10 @@ function resetQRView(){
   el('payment-view').style.display='none';
   el('create-view').style.display='block';
   el('pay-amount').value='';
+  el('verify-hint').innerText='';
   validateAmount();
 }
 
-/* ---- History / Stats ---- */
 function loadHistory(){
   fetch('/api/history').then(r=>r.json()).then(list=>{
     historyData=list;
@@ -838,7 +925,7 @@ function renderTable(){
   if(!rows.length){ tb.innerHTML='<tr><td colspan="7" class="empty-row">'+(q?'কোনো ম্যাচ পাওয়া যায়নি':'No transactions yet')+'</td></tr>'; return; }
   tb.innerHTML=[...rows].reverse().map(t=>{
     const idx=historyData.indexOf(t);
-    return `<tr onclick='showReceipt(historyData[${idx}])' title="Receipt দেখতে ক্লিক করুন">
+    return `<tr onclick='showReceipt(historyData[${idx}])' title="Receipt দেখতে/Download করতে ক্লিক করুন">
       <td><b>${t.order_id}</b></td>
       <td><span class="code-tag">${t.secret_code}</span></td>
       <td>₹${Number(t.amount).toFixed(2)}</td>
@@ -898,9 +985,9 @@ function loadStats(){
   });
 }
 
-/* ---- Receipt ---- */
 function showReceipt(rec){
   if(!rec) return;
+  currentReceiptRec = rec;
   el('r-merchant').innerText=el('merchant-input').value;
   el('r-order').innerText=rec.order_id;
   el('r-code').innerText=rec.secret_code;
@@ -914,7 +1001,50 @@ function showReceipt(rec){
 }
 function closeReceipt(){ el('receipt-modal').classList.remove('open'); }
 
-/* ---- Init ---- */
+async function downloadReceipt(type){
+  if(!currentReceiptRec) return showToast('আগে একটা Receipt খুলুন!','error');
+  const node = el('receipt-print');
+  const rec = currentReceiptRec;
+  const fname = `Receipt_${rec.order_id}_${rec.secret_code}`;
+  const overlay = el('dl-overlay'), dlText = el('dl-text');
+
+  overlay.classList.add('open');
+  dlText.innerText = type==='pdf' ? 'PDF তৈরি হচ্ছে...' : 'Image তৈরি হচ্ছে...';
+
+  try{
+    const modal = el('receipt-modal');
+    modal.style.visibility = 'hidden';
+    const canvas = await html2canvas(node, {scale:3, backgroundColor:'#ffffff', useCORS:true});
+    modal.style.visibility = 'visible';
+
+    if(type === 'png'){
+      const a = document.createElement('a');
+      a.href = canvas.toDataURL('image/png');
+      a.download = fname + '.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      showToast('✅ PNG Downloaded!','success');
+    } else {
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF('p','mm','a5');
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 10;
+      const imgW = pageW - margin*2;
+      const imgH = canvas.height * imgW / canvas.width;
+      const finalH = Math.min(imgH, pageH - margin*2);
+      pdf.addImage(canvas.toDataURL('image/jpeg',0.95),'JPEG',margin,margin,imgW,finalH);
+      pdf.save(fname + '.pdf');
+      showToast('✅ PDF Downloaded!','success');
+    }
+  }catch(e){
+    console.error(e);
+    el('receipt-modal').style.visibility='visible';
+    showToast('❌ Download failed!','error');
+  }finally{
+    overlay.classList.remove('open');
+  }
+}
+
 checkEmailStatus(); loadHistory(); loadStats(); validateAmount();
 setInterval(()=>{ if(el('tab-dash').classList.contains('active')) loadStats(); },10000);
 </script>
@@ -939,6 +1069,8 @@ def api_update_settings():
         CONFIG["UPI_ID"] = data["upi_id"].strip()
     if "merchant_name" in data and data["merchant_name"].strip():
         CONFIG["MERCHANT_NAME"] = data["merchant_name"].strip()
+    if "strict" in data:
+        CONFIG["STRICT_CODE"] = bool(data["strict"])
     return jsonify({"status": "success", "message": "✅ Settings updated successfully!"})
 
 @app.route('/api/create_order')
@@ -999,7 +1131,9 @@ def api_verify_order():
     if order["status"] == "EXPIRED":
         return jsonify({"status": "expired"})
 
-    verified, utr, payer = verify_payment_mail(order["secret_code"], order["amount"])
+    strict = CONFIG.get("STRICT_CODE", False)
+    verified, utr, payer, reason = verify_payment_mail(
+        order["secret_code"], order["amount"], order["created_at"], strict)
 
     if verified and utr not in USED_UTRS:
         now = datetime.datetime.now()
@@ -1008,8 +1142,9 @@ def api_verify_order():
             "secret_code": order["secret_code"],
             "amount": float(order["amount"]),
             "status": "SUCCESS",
-            "payer": payer,          # 🆕 Email থেকে পাওয়া কাস্টমারের নাম
+            "payer": payer,
             "utr": utr,
+            "manual": False,
             "time": now.strftime("%I:%M:%S %p"),
             "date": now.strftime("%Y-%m-%d")
         }
@@ -1020,9 +1155,42 @@ def api_verify_order():
         save_history()
         return jsonify({"status": "success", "record": record})
 
-    return jsonify({"status": "waiting"})
+    if not verified:
+        _log_debug(order_id, reason)
 
-# ================= Cancel Order API =================
+    return jsonify({"status": "waiting", "reason": reason})
+
+# ================= ✋ Manual Verify =================
+@app.route('/api/manual_verify')
+def api_manual_verify():
+    order_id = request.args.get('order_id', '')
+    if order_id not in ACTIVE_ORDERS:
+        return jsonify({"status": "error", "message": "Order not found"}), 404
+
+    order = ACTIVE_ORDERS[order_id]
+    if order["status"] == "SUCCESS":
+        return jsonify({"status": "success", "record": order.get("record")})
+    if order["status"] != "PENDING":
+        return jsonify({"status": "error", "message": "Order cancelled/expired"}), 400
+
+    now = datetime.datetime.now()
+    record = {
+        "order_id": order_id,
+        "secret_code": order["secret_code"],
+        "amount": float(order["amount"]),
+        "status": "SUCCESS",
+        "payer": "Manual (Merchant)",
+        "utr": "MANUAL-" + order["secret_code"],
+        "manual": True,
+        "time": now.strftime("%I:%M:%S %p"),
+        "date": now.strftime("%Y-%m-%d")
+    }
+    order["status"] = "SUCCESS"
+    order["record"] = record
+    PAYMENT_HISTORY.append(record)
+    save_history()
+    return jsonify({"status": "success", "record": record})
+
 @app.route('/api/cancel_order')
 def api_cancel_order():
     order_id = request.args.get('order_id', '')
@@ -1044,6 +1212,7 @@ def api_cancel_order():
         "status": "CANCELLED",
         "payer": None,
         "utr": "—",
+        "manual": False,
         "time": now.strftime("%I:%M:%S %p"),
         "date": now.strftime("%Y-%m-%d")
     }
@@ -1084,17 +1253,18 @@ def api_stats():
 def api_export():
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Order ID", "Code", "Amount", "Status", "Payer Name", "UTR", "Date", "Time"])
+    writer.writerow(["Order ID", "Code", "Amount", "Status", "Payer Name", "UTR", "Manual", "Date", "Time"])
     for t in PAYMENT_HISTORY:
         writer.writerow([t["order_id"], t["secret_code"], t["amount"], t.get("status", "SUCCESS"),
-                         t.get("payer", ""), t.get("utr", ""), t.get("date", ""), t["time"]])
+                         t.get("payer", ""), t.get("utr", ""), t.get("manual", False),
+                         t.get("date", ""), t["time"]])
     return Response(
         output.getvalue(),
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=transactions.csv"}
     )
 
-# ================= Debug: শেষ ইমেইলগুলোতে কী ধরা পড়ছে দেখুন =================
+# ================= Debug =================
 @app.route('/api/debug/emails')
 def api_debug_emails():
     emails = get_recent_emails()
@@ -1104,12 +1274,15 @@ def api_debug_emails():
             "subject": subject[:80],
             "from": str(msg.get("From", ""))[:60],
             "date": str(msg.get("Date", ""))[:30],
-            "extracted_payer": extract_payer_name(subject, body),   # 👈 এই নামটাই দেখাবে
+            "extracted_payer": extract_payer_name(subject, body),
             "body_preview": body[:300]
         })
     return jsonify(result)
 
-# ================= Debug: নিজের টেক্সট দিয়ে নাম-extraction টেস্ট =================
+@app.route('/api/debug/log')
+def api_debug_log():
+    return jsonify(DEBUG_LOG)
+
 @app.route('/api/debug/test_name', methods=['POST'])
 def api_debug_test_name():
     data = request.json or {}
