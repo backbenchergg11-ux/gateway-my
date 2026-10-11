@@ -22,58 +22,105 @@ CONFIG = {
     "GMAIL_PASS": "cjmjsbslgwdzbfrw",
     "UPI_ID": "tanmaykundu439@yesfam",
     "MERCHANT_NAME": "BN Enterprises",
-    "STRICT_CODE": False,       # 🔓 False = Relaxed mode
-    "SECURITY_SWITCH": False,   # 🚨 Anti-theft charger alarm
+    "STRICT_CODE": False,       # 🔓 False = শিথিল মোড
+    "SECURITY_SWITCH": False,   # 🚨 চার্জার অ্যালার্ম
     "SECURITY_PIN": "1234"
 }
 
-PAYMENT_HISTORY = []
-ACTIVE_ORDERS = {}
-USED_UTRS = set()
-USED_EMAIL_IDS = set()
+ORDER_TIMEOUT = 300
+EMAIL_FETCH_COUNT = 20
+EMAIL_LOOKBACK_MIN = 30
+SUCCESS_SHOW_SEC = 20        # ডিসপ্লেতে success কতক্ষণ দেখাবে
+
+HISTORY_FILE = "payment_history.json"
+ORDERS_FILE = "orders_state.json"    # 💾 সব worker একসাথে এটা share করবে
+
 DEBUG_LOG = []
-CURRENT_ORDER_ID = None
 ALARM_ACK = 0
 
-ORDER_TIMEOUT = 300
-EMAIL_FETCH_COUNT = 15
-EMAIL_LOOKBACK_MIN = 30
-HISTORY_FILE = "payment_history.json"
-
-_gmail_lock = threading.Lock()
-_imap = None
-_email_cache = []
-_last_fetch = 0
+_state_lock = threading.Lock()
 
 def _log_debug(order_id, reason):
     DEBUG_LOG.append({"time": datetime.datetime.now().strftime("%H:%M:%S"),
-                      "order_id": order_id, "reason": reason})
-    del DEBUG_LOG[:-30]
+                      "order_id": str(order_id), "reason": str(reason)[:100]})
+    del DEBUG_LOG[:-40]
 
-# ================= হিস্টোরি সেভ / লোড =================
-def save_history():
+# ================= 💾 File-backed State (Cross-Device Fix) =================
+def read_orders():
+    """সব worker একই ফাইল পড়বে — তাই এক device-এর order আরেক device-এ দেখা যাবে"""
+    with _state_lock:
+        try:
+            with open(ORDERS_FILE) as f:
+                d = json.load(f)
+            return (d.get("current_order_id"),
+                    d.get("orders", {}),
+                    set(d.get("used_utrs", [])),
+                    set(d.get("used_emails", [])))
+        except Exception:
+            return None, {}, set(), set()
+
+def write_orders(cur, orders, used_utrs, used_emails):
+    with _state_lock:
+        try:
+            with open(ORDERS_FILE, "w") as f:
+                json.dump({
+                    "current_order_id": cur,
+                    "orders": orders,
+                    "used_utrs": list(used_utrs)[-200:],
+                    "used_emails": list(used_emails)[-300:]
+                }, f)
+        except Exception:
+            pass
+
+def get_history():
     try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(PAYMENT_HISTORY, f)
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def append_history(recs):
+    if not recs:
+        return
+    try:
+        hist = get_history()
+        known = {t.get("order_id") for t in hist}
+        new = [r for r in recs if r.get("order_id") not in known]
+        if new:
+            hist.extend(new)
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(hist, f)
     except Exception:
         pass
 
-def load_history():
-    global PAYMENT_HISTORY
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE) as f:
-                PAYMENT_HISTORY = json.load(f)
-            for t in PAYMENT_HISTORY:
-                t.setdefault("status", "SUCCESS")
-                t.setdefault("payer", None)
-                t.setdefault("date", "")
-    except Exception:
-        pass
+def cleanup_orders_dict(orders):
+    """মেয়াদোত্তীর্ণ অর্ডার EXPIRED করে — রেকর্ড ফেরত দেয়"""
+    now = time.time()
+    changed = False
+    recs = []
+    for oid, o in list(orders.items()):
+        if o.get("status") == "PENDING" and now - o.get("created_at", now) > ORDER_TIMEOUT:
+            o["status"] = "EXPIRED"
+            rec = {
+                "order_id": oid,
+                "secret_code": o["secret_code"],
+                "amount": float(o["amount"]),
+                "status": "EXPIRED",
+                "payer": None,
+                "utr": "—",
+                "time": datetime.datetime.now().strftime("%I:%M:%S %p"),
+                "date": datetime.datetime.now().strftime("%Y-%m-%d")
+            }
+            o["record"] = rec
+            recs.append(rec)
+            changed = True
+    return changed, recs
 
-load_history()
+# ================= ⚡ Gmail (Persistent + UID Cache) =================
+_gmail_lock = threading.Lock()
+_imap = None
+_uid_cache = {}
 
-# ================= ⚡ Persistent Gmail কানেকশন =================
 def _get_imap():
     global _imap
     if _imap is not None:
@@ -129,27 +176,42 @@ def _decode_subject(msg):
     except Exception:
         return str(msg.get("Subject", ""))
 
-# ================= 🆕 Background Email Poller =================
+_last_fetch = 0
+
 def _fetch_emails_once():
-    global _email_cache, _last_fetch, _imap
+    global _last_fetch, _imap
     try:
         with _gmail_lock:
             m = _get_imap()
             m.select("inbox")
             since = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
-            _, messages = m.search(None, f'(SINCE "{since}")')
-            ids = messages[0].split()[-EMAIL_FETCH_COUNT:]
-            parsed = []
-            for m_id in reversed(ids):
-                _, data = m.fetch(m_id, "(RFC822)")
-                for part in data:
-                    if isinstance(part, tuple):
-                        msg = email.message_from_bytes(part[1])
-                        parsed.append((msg, _decode_subject(msg), _parse_body(msg)))
-            _email_cache = parsed
+            _, messages = m.uid('search', None, f'(SINCE "{since}")')
+            uids = messages[0].split()[-EMAIL_FETCH_COUNT:]
+
+            for uid in reversed(uids):
+                u = uid.decode()
+                if u in _uid_cache:
+                    continue
+                try:
+                    _, data = m.uid('fetch', uid, '(RFC822)')
+                    for part in data:
+                        if isinstance(part, tuple):
+                            msg = email.message_from_bytes(part[1])
+                            _uid_cache[u] = (msg, _decode_subject(msg), _parse_body(msg))
+                            break
+                except Exception:
+                    continue
+
+            if len(_uid_cache) > 40:
+                keep = set(x.decode() for x in uids)
+                for k in list(_uid_cache.keys()):
+                    if k not in keep:
+                        del _uid_cache[k]
+
             _last_fetch = time.time()
             return True
-    except Exception:
+    except Exception as e:
+        _log_debug("poller", e)
         try:
             if _imap:
                 _imap.logout()
@@ -159,21 +221,27 @@ def _fetch_emails_once():
         return False
 
 def email_poller():
+    fails = 0
     while True:
         ok = _fetch_emails_once()
-        time.sleep(2 if ok else 3)
+        if ok:
+            fails = 0
+            time.sleep(2)
+        else:
+            fails += 1
+            time.sleep(min(3 + fails, 10))
 
 threading.Thread(target=email_poller, daemon=True).start()
 
 def get_recent_emails():
-    return _email_cache
+    return list(_uid_cache.values())
 
 def test_gmail_connection():
     if _last_fetch and (time.time() - _last_fetch) < 25:
-        return True, "Gmail Connected & Active"
+        return True, "জিমেইল কানেক্টেড"
     if _fetch_emails_once():
-        return True, "Gmail Connected & Active"
-    return False, "Gmail Connection Error — কিছুক্ষণ পরে আবার দেখুন"
+        return True, "জিমেইল কানেক্টেড"
+    return False, "জিমেইল কানেকশন সমস্যা — অপেক্ষা করুন"
 
 # ================= Payer Name Extractor =================
 def extract_payer_name(subject, body):
@@ -224,15 +292,24 @@ def _is_recent_mail(msg):
         if not dt:
             return True
         age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
-        return -120 < age < EMAIL_LOOKBACK_MIN * 60
+        return -180 < age < EMAIL_LOOKBACK_MIN * 60
     except Exception:
         return True
 
-# ================= পেমেন্ট ভেরিফিকেশন =================
-def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=True):
+# ================= ✅ পেমেন্ট ভেরিফিকেশন =================
+AMOUNT_PATTERNS = [
+    r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)",
+    r"([\d,]+(?:\.\d{1,2})?)\s*(?:rs\.?|inr|/-)",
+]
+CREDIT_WORDS = ["credited", "received", "deposited", "added", "got"]
+DEBIT_WORDS = ["debited", "sent to", "paid to", "withdrawn"]
+
+def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=True, used_emails=None):
     emails = get_recent_emails()
     target = str(secret_code).strip().lower()
     expected = round(float(expected_amount), 2)
+    if used_emails is None:
+        used_emails = set()
 
     if not emails:
         return False, None, None, "no_emails"
@@ -247,14 +324,14 @@ def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=Tr
             mid = (msg.get("Message-ID") or (subject + str(msg.get("Date")))).strip()
         except Exception:
             mid = subject + str(msg.get("Date"))
-        if mid in USED_EMAIL_IDS:
+        if mid in used_emails:
             last_reason = "email_used"
             continue
 
         if created_at is not None:
             try:
                 dt = parsedate_to_datetime(msg.get("Date"))
-                if dt and dt.timestamp() < (created_at - 120):
+                if dt and dt.timestamp() < (created_at - 180):
                     last_reason = "too_old"
                     continue
             except Exception:
@@ -263,17 +340,20 @@ def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=Tr
         text = f"{subject} {body}"
         low = text.lower()
 
-        if "debited" in low and "credited" not in low and "received" not in low:
+        if any(w in low for w in DEBIT_WORDS) and not any(w in low for w in CREDIT_WORDS):
             continue
 
-        if not any(w in low for w in ["credited", "received", "deposited", "added", "upi"]):
+        if not any(w in low for w in CREDIT_WORDS) and "upi" not in low:
             continue
 
         code_found = target in low
 
-        amounts = re.findall(r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)", text, re.IGNORECASE)
+        all_amounts = []
+        for pat in AMOUNT_PATTERNS:
+            all_amounts += re.findall(pat, text, re.IGNORECASE)
+
         amount_match = False
-        for a in amounts:
+        for a in all_amounts:
             try:
                 val = float(a.replace(",", ""))
             except ValueError:
@@ -295,37 +375,12 @@ def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=Tr
             text, re.IGNORECASE)
         utr = m.group(1) if m else ("UPI-" + secret_code)
         payer = extract_payer_name(subject, body)
-        USED_EMAIL_IDS.add(mid)
-        if len(USED_EMAIL_IDS) > 200:
-            USED_EMAIL_IDS.clear()
+        used_emails.add(mid)
         return True, utr, payer, "matched"
 
     return False, None, None, last_reason
 
-# ================= Expired অর্ডার → History =================
-def cleanup_expired_orders():
-    now = time.time()
-    changed = False
-    for oid, o in list(ACTIVE_ORDERS.items()):
-        if o["status"] == "PENDING" and now - o["created_at"] > ORDER_TIMEOUT:
-            o["status"] = "EXPIRED"
-            rec = {
-                "order_id": oid,
-                "secret_code": o["secret_code"],
-                "amount": float(o["amount"]),
-                "status": "EXPIRED",
-                "payer": None,
-                "utr": "—",
-                "time": datetime.datetime.now().strftime("%I:%M:%S %p"),
-                "date": datetime.datetime.now().strftime("%Y-%m-%d")
-            }
-            o["record"] = rec
-            PAYMENT_HISTORY.append(rec)
-            changed = True
-    if changed:
-        save_history()
-
-# ================= Merchant UI =================
+# ================= UI (সম্পূর্ণ বাংলা) =================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="bn">
@@ -335,7 +390,7 @@ HTML_TEMPLATE = """
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>BN Enterprises - Fuel POS Terminal</title>
+<title>বিএন এন্টারপ্রাইজেস</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -418,7 +473,7 @@ input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgb
 .thank-time{font-size:13px;color:var(--muted);font-weight:600;margin-top:4px}
 @keyframes namePop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
 
-/* ================= 🖥️ Customer Display Device Mode ================= */
+/* 🖥️ কাস্টমার ডিসপ্লে */
 body.display-mode{background:#04281e;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
 #display-app{display:none;position:fixed;inset:0;flex-direction:column}
 body.display-mode #display-app{display:flex}
@@ -434,7 +489,6 @@ body.display-mode #pos-app{display:none}
 .dsp-screen.idle{background:linear-gradient(-45deg,#1e293b,#334155,#475569,#334155);background-size:400% 400%}
 .dsp-merchant{position:fixed;top:20px;left:0;right:0;text-align:center;font-size:15px;font-weight:800;opacity:.8;letter-spacing:1px;pointer-events:none;z-index:5}
 
-/* 🫧 Waiting-for-bill Bubble Animation */
 .bubble-wrap{position:relative;width:130px;height:130px;margin-bottom:8px}
 .bubble{position:absolute;border-radius:50%;animation:bubbleFloat 4s ease-in-out infinite}
 .b1{width:112px;height:112px;left:9px;top:9px;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.16)}
@@ -468,7 +522,7 @@ body.display-mode #pos-app{display:none}
 
 @keyframes cdPop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.12)}100%{transform:scale(1);opacity:1}}
 
-/* ================= 🚨 Security Alarm ================= */
+/* 🚨 নিরাপত্তা অ্যালার্ম */
 .alarm-overlay{position:fixed;inset:0;background:#7f1d1d;z-index:20000;display:none;flex-direction:column;align-items:center;justify-content:center;color:#fff;text-align:center;padding:20px;animation:alarmBg .5s infinite}
 .alarm-overlay.open{display:flex}
 .alarm-icon{font-size:90px;animation:alarmShake .35s infinite}
@@ -553,22 +607,19 @@ tbody tr:hover{background:#f8fafc}
 </head>
 <body>
 
-<!-- ============================================================ -->
-<!-- ================== 🖥️ CUSTOMER DISPLAY APP ================= -->
-<!-- ============================================================ -->
+<!-- 🖥️ কাস্টমার ডিসপ্লে -->
 <div id="display-app">
   <div class="dsp-activate" id="dsp-activate">
     <div class="dsp-logo">⛽</div>
     <div class="dsp-name">{{ config.MERCHANT_NAME }}</div>
-    <div style="font-size:14px;opacity:.7">Customer Payment Display</div>
+    <div style="font-size:14px;opacity:.7">কাস্টমার পেমেন্ট ডিসপ্লে</div>
     <div class="dsp-tap">👆 চালু করতে একবার টাচ করুন</div>
-    <div style="font-size:12px;opacity:.6">Full Screen · স্ক্রিন সবসময় জ্বলজ্বল · টাচ লক</div>
+    <div style="font-size:12px;opacity:.6">স্ক্রিন সবসময় জ্বলজ্বল থাকবে</div>
   </div>
 
   <div class="dsp-screen idle" id="dsp-screen">
     <div class="dsp-merchant" id="dsp-merchant">{{ config.MERCHANT_NAME }}</div>
 
-    <!-- 🫧 Idle: waiting-for-bill bubbles -->
     <div id="dsp-idle">
       <div class="bubble-wrap">
         <div class="bubble b1"></div>
@@ -578,33 +629,31 @@ tbody tr:hover{background:#f8fafc}
         <div class="dsp-idle-logo">⛽</div>
       </div>
       <div class="dsp-idle-txt">🧾 বিল তৈরির অপেক্ষায়...</div>
-      <div class="dsp-idle-sub">কাউন্টার থেকে QR আসলে এখানে দেখা যাবে</div>
+      <div class="dsp-idle-sub">কাউন্টার থেকে কিউআর আসলে এখানে দেখা যাবে</div>
       <div class="dsp-idle-pulse"><span></span><span></span><span></span></div>
     </div>
 
     <div id="dsp-waiting" style="display:none">
       <div class="dsp-amount" id="dsp-amount">₹0</div>
       <div class="dsp-qr" id="dsp-qr"></div>
-      <div class="dsp-code">Code: <span id="dsp-code" class="code-tag"></span></div>
-      <div class="dsp-wait"><span class="dots"><span></span><span></span><span></span></span> উপরের QR স্ক্যান করে পেমেন্ট করুন</div>
+      <div class="dsp-code">কোড: <span id="dsp-code" class="code-tag"></span></div>
+      <div class="dsp-wait"><span class="dots"><span></span><span></span><span></span></span> উপরের কিউআর স্ক্যান করে পেমেন্ট করুন</div>
     </div>
 
     <div id="dsp-success" style="display:none">
       <div class="dsp-check">✅</div>
-      <div class="dsp-thanks">Thank You!</div>
-      <div class="dsp-payer"><span class="at">@</span><span id="dsp-payer">Customer</span></div>
+      <div class="dsp-thanks">ধন্যবাদ!</div>
+      <div class="dsp-payer"><span class="at">@</span><span id="dsp-payer">কাস্টমার</span></div>
       <div class="dsp-msg">আপনার পেমেন্ট সফল হয়েছে</div>
       <div class="dsp-amt2" id="dsp-amt2">₹0.00</div>
       <div class="dsp-time">🕐 <span id="dsp-time"></span></div>
     </div>
   </div>
-  <div class="wl-indicator" id="dsp-wl">🔆 Screen Awake</div>
-  <div id="fs-hint">⛶ Full Screen-এ ফিরতে স্ক্রিনে টাচ করুন</div>
+  <div class="wl-indicator" id="dsp-wl">🔆 স্ক্রিন চালু</div>
+  <div id="fs-hint">⛶ ফুল স্ক্রিনে ফিরতে স্ক্রিনে টাচ করুন</div>
 </div>
 
-<!-- ============================================================ -->
-<!-- ===================== ⛽ POS APP ============================ -->
-<!-- ============================================================ -->
+<!-- ⛽ কাউন্টার -->
 <div id="pos-app">
 <div class="container">
 
@@ -613,46 +662,42 @@ tbody tr:hover{background:#f8fafc}
       <div class="merchant-logo">⛽</div>
       <div>
         <h2 style="margin:0;font-size:20px;" id="hdr-merchant">{{ config.MERCHANT_NAME }}</h2>
-        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">UPI Auto-Verify Engine v4.1 · Dual Device</div>
+        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">অটো পেমেন্ট ভেরিফাই সিস্টেম</div>
       </div>
     </div>
     <div class="badge-group">
       <div class="badge badge-glass live-clock">🕐 <span id="clock">--:--:--</span></div>
-      <div id="email-status-badge" class="badge badge-offline"><span class="live-dot" style="background:#f87171"></span> Checking Gmail...</div>
+      <div id="email-status-badge" class="badge badge-offline"><span class="live-dot" style="background:#f87171"></span> জিমেইল চেক হচ্ছে...</div>
     </div>
   </div>
 
   <div class="tabs">
-    <button class="tab active" id="btn-pos" onclick="switchTab('pos')">⛽ POS Terminal</button>
-    <button class="tab" id="btn-dash" onclick="switchTab('dash')">📊 Merchant Dashboard</button>
+    <button class="tab active" id="btn-pos" onclick="switchTab('pos')">⛽ বিল কাউন্টার</button>
+    <button class="tab" id="btn-dash" onclick="switchTab('dash')">📊 ড্যাশবোর্ড</button>
   </div>
 
   <section id="tab-pos" class="tab-content active">
     <div class="grid-layout">
       <div class="card anim d1">
-        <h3>⚙️ Merchant Settings</h3>
-        <label>Active UPI ID</label>
+        <h3>⚙️ দোকান সেটিংস</h3>
+        <label>ইউপিআই আইডি</label>
         <input type="text" id="upi-input" value="{{ config.UPI_ID }}">
-        <label>Merchant / Pump Name</label>
+        <label>দোকানের নাম</label>
         <input type="text" id="merchant-input" value="{{ config.MERCHANT_NAME }}">
         <label class="toggle-row">
           <input type="checkbox" id="strict-toggle" {{ 'checked' if config.STRICT_CODE else '' }}>
-          🔐 Strict Mode — ইমেইলে FP কোড থাকতেই হবে
+          🔐 কড়া মোড — ইমেইলে কোড থাকতেই হবে
         </label>
         <label class="toggle-row">
           <input type="checkbox" id="security-toggle" {{ 'checked' if config.SECURITY_SWITCH else '' }}>
-          🚨 Security Switch — চার্জার খুললে অ্যালার্ম (PIN লাগবে বন্ধ করতে)
+          🚨 নিরাপত্তা সুইচ — চার্জার খুললে অ্যালার্ম বাজবে
         </label>
-        <button class="btn dark" onclick="updateSettings()">💾 Save Settings</button>
-        <button class="btn" style="background:#0d9488;margin-top:10px" onclick="window.open('/?mode=display','_blank')">🖥️ Open Customer Display (2nd Device)</button>
-        <div style="margin-top:14px;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12.5px;color:var(--muted);line-height:1.6">
-          ℹ️ <b>দুই ডিভাইস সেটআপ:</b> কাস্টমারের সামনে রাখা ফোনে <b>?mode=display</b> লিংক খুলুন → একবার টাচ করলেই Full Screen-এ চালু হবে। QR generate করলেই ওখানে animation সহ দেখাবে।<br>
-          🚨 <b>Security ON:</b> চার্জার থেকে ফোন খুললেই সাইরেন। বন্ধ করতে PIN (<b>1234</b>) দিন।
-        </div>
+        <button class="btn dark" onclick="updateSettings()">💾 সেটিংস সেভ করুন</button>
+        <button class="btn" style="background:#0d9488;margin-top:10px" onclick="window.open('/?mode=display','_blank')">🖥️ কাস্টমার ডিসপ্লে খুলুন (দ্বিতীয় ফোন)</button>
       </div>
 
       <div class="card qr-display anim d2">
-        <h3 style="text-align:left">💳 Dynamic Payment QR</h3>
+        <h3 style="text-align:left">💳 পেমেন্ট কিউআর</h3>
         <div id="create-view">
           <div class="quick-row">
             <button class="quick-btn" onclick="setAmount(100)">₹100</button>
@@ -661,82 +706,81 @@ tbody tr:hover{background:#f8fafc}
             <button class="quick-btn" onclick="setAmount(1000)">₹1000</button>
           </div>
           <input type="number" id="pay-amount" placeholder="টাকার পরিমাণ লিখুন" min="1" oninput="validateAmount()">
-          <button class="btn" id="gen-btn" onclick="generateQR()" disabled>Generate QR Code</button>
-          <div id="lock-msg" style="color:var(--danger);font-size:13px;margin-top:10px;display:none">⚠️ Gmail disconnected!</div>
+          <button class="btn" id="gen-btn" onclick="generateQR()" disabled>কিউআর কোড তৈরি করুন</button>
+          <div id="lock-msg" style="color:var(--danger);font-size:13px;margin-top:10px;display:none">⚠️ জিমেইল কানেক্টেড নেই!</div>
         </div>
 
         <div id="payment-view" style="display:none">
           <div id="pay-active">
             <div id="order-info" style="font-weight:800;color:var(--primary);font-size:18px"></div>
-            <div style="font-size:13px;color:var(--muted);margin-top:4px">UPI Note Code: <span id="secret-code-display" class="code-tag"></span></div>
+            <div style="font-size:13px;color:var(--muted);margin-top:4px">পেমেন্ট কোড: <span id="secret-code-display" class="code-tag"></span></div>
             <div id="qr-box"></div>
             <div id="payment-status" class="status-pill status-waiting"><span class="dots"><span></span><span></span><span></span></span> ব্যাংক কনফার্মেশনের অপেক্ষায়...</div>
-            <div id="verify-hint" style="font-size:12px;color:var(--muted);margin-top:8px;min-height:16px;text-align:center"></div>
             <div class="timer-wrap"><div id="timer-bar"></div></div>
-            <div id="timer-text">Expires in 05:00</div>
-            <button class="btn red" onclick="cancelOrder()">✖ Cancel Order</button>
+            <div id="timer-text">মেয়াদ শেষ হবে 05:00</div>
+            <button class="btn red" onclick="cancelOrder()">✖ বিল বাতিল করুন</button>
           </div>
 
           <div id="pay-success" style="display:none">
             <svg class="checkmark" viewBox="0 0 52 52"><circle cx="26" cy="26" r="25"/><path d="M14.1 27.2l7.1 7.2 16.7-16.8"/></svg>
 
             <div class="thank-card">
-              <div class="thank-title">🙏 PAYMENT RECEIVED</div>
-              <div class="thank-name"><span class="at">@</span><span id="thank-name">Customer</span></div>
-              <div class="thank-msg">Thank you for your payment · পেমেন্টের জন্য ধন্যবাদ</div>
+              <div class="thank-title">🙏 পেমেন্ট পাওয়া গেছে</div>
+              <div class="thank-name"><span class="at">@</span><span id="thank-name">কাস্টমার</span></div>
+              <div class="thank-msg">পেমেন্টের জন্য ধন্যবাদ</div>
             </div>
 
             <div class="thank-amount-box">
-              <div class="thank-label">💰 AMOUNT RECEIVED</div>
+              <div class="thank-label">💰 প্রাপ্ত টাকা</div>
               <div class="thank-amount" id="thank-amount">₹0.00</div>
-              <div class="thank-time">🕐 Received at: <span id="thank-time">--:--:--</span></div>
+              <div class="thank-time">🕐 সময়: <span id="thank-time">--:--:--</span></div>
             </div>
 
             <div id="success-details"></div>
 
-            <button class="btn" onclick="showReceipt(lastRecord)">🧾 View / Download Receipt</button>
-            <button class="btn gray" onclick="resetQRView()">➕ New Bill</button>
+            <button class="btn" onclick="showReceipt(lastRecord)">🧾 রশিদ দেখুন / ডাউনলোড করুন</button>
+            <button class="btn gray" onclick="resetQRView()">➕ নতুন বিল</button>
           </div>
         </div>
       </div>
     </div>
 
     <div class="card anim d3">
-      <h3>🧾 Recent Payments</h3>
-      <div class="mini-list" id="recent-list"><div style="color:var(--muted);font-size:13.5px;text-align:center;padding:14px">No verified transactions yet</div></div>
+      <h3>🧾 সাম্প্রতিক পেমেন্ট</h3>
+      <div class="mini-list" id="recent-list"><div style="color:var(--muted);font-size:13.5px;text-align:center;padding:14px">এখনো কোনো পেমেন্ট হয়নি</div></div>
     </div>
   </section>
 
   <section id="tab-dash" class="tab-content">
     <div class="stats-grid">
-      <div class="stat-card"><div class="stat-icon" style="background:#eff6ff">💰</div><div><div class="stat-val" id="stat-today">₹0.00</div><div class="stat-sub" id="stat-today-count">Today's Sales — 0 txn</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#f0fdf4">📈</div><div><div class="stat-val" id="stat-total">₹0.00</div><div class="stat-sub">Total Revenue (All Time)</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#faf5ff">🧮</div><div><div class="stat-val" id="stat-avg">₹0.00</div><div class="stat-sub">Average Sale Value</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#fef2f2">🚫</div><div><div class="stat-val" id="stat-cancelled">0</div><div class="stat-sub" id="stat-cancelled-sub">Cancelled / Expired</div></div></div>
-      <div class="stat-card"><div class="stat-icon" style="background:#ecfeff">🎯</div><div><div class="stat-val" id="stat-rate">0%</div><div class="stat-sub">Success Rate</div></div></div>
+      <div class="stat-card"><div class="stat-icon" style="background:#eff6ff">💰</div><div><div class="stat-val" id="stat-today">₹0.00</div><div class="stat-sub" id="stat-today-count">আজকের বিক্রি — 0 টি</div></div></div>
+      <div class="stat-card"><div class="stat-icon" style="background:#f0fdf4">📈</div><div><div class="stat-val" id="stat-total">₹0.00</div><div class="stat-sub">মোট আয় (সব মিলিয়ে)</div></div></div>
+      <div class="stat-card"><div class="stat-icon" style="background:#faf5ff">🧮</div><div><div class="stat-val" id="stat-avg">₹0.00</div><div class="stat-sub">গড় বিক্রি</div></div></div>
+      <div class="stat-card"><div class="stat-icon" style="background:#fef2f2">🚫</div><div><div class="stat-val" id="stat-cancelled">0</div><div class="stat-sub" id="stat-cancelled-sub">বাতিল / মেয়াদোত্তীর্ণ</div></div></div>
+      <div class="stat-card"><div class="stat-icon" style="background:#ecfeff">🎯</div><div><div class="stat-val" id="stat-rate">0%</div><div class="stat-sub">সফলতার হার</div></div></div>
     </div>
 
     <div class="card anim d2">
-      <h3>📊 Last Successful Transactions</h3>
-      <div class="chart" id="chart"><div style="color:var(--muted);font-size:13px">No data yet</div></div>
+      <h3>📊 সাম্প্রতিক সফল লেনদেন</h3>
+      <div class="chart" id="chart"><div style="color:var(--muted);font-size:13px">এখনো ডেটা নেই</div></div>
     </div>
 
     <div class="card anim d3">
       <div class="toolbar">
-        <input class="search-input" id="search-input" placeholder="🔍 Search Order / Code / UTR / Payer..." oninput="renderTable()">
-        <button class="btn small" style="background:var(--success)" onclick="window.location='/api/export'">⬇️ Export CSV</button>
-        <button class="btn small" style="background:#334155" onclick="refreshDashboard()">🔄 Refresh</button>
+        <input class="search-input" id="search-input" placeholder="🔍 খুঁজুন: অর্ডার / কোড / ইউটিআর / নাম..." oninput="renderTable()">
+        <button class="btn small" style="background:var(--success)" onclick="window.location='/api/export'">⬇️ সিএসভি ডাউনলোড</button>
+        <button class="btn small" style="background:#334155" onclick="refreshDashboard()">🔄 রিফ্রেশ</button>
       </div>
       <div class="filter-row">
-        <button class="chip active" onclick="setFilter('ALL',this)">📋 All</button>
-        <button class="chip" onclick="setFilter('SUCCESS',this)">✅ Success</button>
-        <button class="chip" onclick="setFilter('CANCELLED',this)">❌ Cancelled</button>
-        <button class="chip" onclick="setFilter('EXPIRED',this)">⏰ Expired</button>
+        <button class="chip active" onclick="setFilter('ALL',this)">📋 সব</button>
+        <button class="chip" onclick="setFilter('SUCCESS',this)">✅ সফল</button>
+        <button class="chip" onclick="setFilter('CANCELLED',this)">❌ বাতিল</button>
+        <button class="chip" onclick="setFilter('EXPIRED',this)">⏰ মেয়াদ শেষ</button>
       </div>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Order ID</th><th>Code</th><th>Amount</th><th>Status</th><th>Payer</th><th>UTR / Ref</th><th>Date & Time</th></tr></thead>
-        <tbody id="history-body"><tr><td colspan="7" class="empty-row">No transactions yet</td></tr></tbody>
+        <thead><tr><th>অর্ডার</th><th>কোড</th><th>টাকা</th><th>অবস্থা</th><th>নাম</th><th>ইউটিআর</th><th>তারিখ ও সময়</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="7" class="empty-row">এখনো কোনো লেনদেন নেই</td></tr></tbody>
       </table>
       </div>
     </div>
@@ -744,24 +788,24 @@ tbody tr:hover{background:#f8fafc}
 </div>
 </div>
 
-<!-- 🚨 Security Alarm Overlay -->
+<!-- 🚨 নিরাপত্তা অ্যালার্ম -->
 <div class="alarm-overlay" id="alarm-overlay">
   <div class="alarm-icon">🚨</div>
-  <div class="alarm-title">SECURITY ALARM!</div>
-  <div class="alarm-sub">ডিভাইস চার্জার থেকে খোলা হয়েছে! বন্ধ করতে PIN দিন।</div>
+  <div class="alarm-title">নিরাপত্তা অ্যালার্ম!</div>
+  <div class="alarm-sub">ডিভাইস চার্জার থেকে খোলা হয়েছে! বন্ধ করতে পিন দিন।</div>
   <div class="alarm-pinbox" id="alarm-pins"></div>
   <div class="alarm-pad">
-    <button class="alarm-key" onclick="pinKey('1')">1</button>
-    <button class="alarm-key" onclick="pinKey('2')">2</button>
-    <button class="alarm-key" onclick="pinKey('3')">3</button>
-    <button class="alarm-key" onclick="pinKey('4')">4</button>
-    <button class="alarm-key" onclick="pinKey('5')">5</button>
-    <button class="alarm-key" onclick="pinKey('6')">6</button>
-    <button class="alarm-key" onclick="pinKey('7')">7</button>
-    <button class="alarm-key" onclick="pinKey('8')">8</button>
-    <button class="alarm-key" onclick="pinKey('9')">9</button>
+    <button class="alarm-key" onclick="pinKey('1')">১</button>
+    <button class="alarm-key" onclick="pinKey('2')">২</button>
+    <button class="alarm-key" onclick="pinKey('3')">৩</button>
+    <button class="alarm-key" onclick="pinKey('4')">৪</button>
+    <button class="alarm-key" onclick="pinKey('5')">৫</button>
+    <button class="alarm-key" onclick="pinKey('6')">৬</button>
+    <button class="alarm-key" onclick="pinKey('7')">৭</button>
+    <button class="alarm-key" onclick="pinKey('8')">৮</button>
+    <button class="alarm-key" onclick="pinKey('9')">৯</button>
     <button class="alarm-key" onclick="pinKey('C')">C</button>
-    <button class="alarm-key" onclick="pinKey('0')">0</button>
+    <button class="alarm-key" onclick="pinKey('0')">০</button>
     <button class="alarm-key" style="background:#16a34a" onclick="pinSubmit()">✓</button>
   </div>
   <div class="alarm-err" id="alarm-err"></div>
@@ -771,48 +815,46 @@ tbody tr:hover{background:#f8fafc}
   <div>
     <div class="receipt" id="receipt-print">
       <div class="r-head">⛽ <span id="r-merchant"></span></div>
-      <div class="r-sub">UPI Payment Receipt</div>
+      <div class="r-sub">ইউপিআই পেমেন্ট রশিদ</div>
       <div class="r-sub" style="font-size:11px;">📧 tanmaykundu439@gmail.com</div>
       <div class="r-sep"></div>
-      <div class="r-row"><span>Order ID</span><b id="r-order"></b></div>
-      <div class="r-row"><span>UPI Code</span><b id="r-code" class="code-tag"></b></div>
-      <div class="r-row"><span>Payer Name</span><b id="r-payer"></b></div>
-      <div class="r-row"><span>UTR / Ref</span><b id="r-utr"></b></div>
-      <div class="r-row"><span>Date</span><b id="r-date"></b></div>
-      <div class="r-row"><span>Time</span><b id="r-time"></b></div>
+      <div class="r-row"><span>অর্ডার আইডি</span><b id="r-order"></b></div>
+      <div class="r-row"><span>পেমেন্ট কোড</span><b id="r-code" class="code-tag"></b></div>
+      <div class="r-row"><span>পাঠানোর নাম</span><b id="r-payer"></b></div>
+      <div class="r-row"><span>ইউটিআর / রেফ</span><b id="r-utr"></b></div>
+      <div class="r-row"><span>তারিখ</span><b id="r-date"></b></div>
+      <div class="r-row"><span>সময়</span><b id="r-time"></b></div>
       <div class="r-sep"></div>
-      <div class="r-total"><span>Total Paid</span><span id="r-amount"></span></div>
+      <div class="r-total"><span>মোট পরিশোধ</span><span id="r-amount"></span></div>
       <div class="r-sep"></div>
-      <div class="r-sub">✅ Verified via Gmail Auto-Engine</div>
+      <div class="r-sub">✅ জিমেইল অটো-ভেরিফাই সিস্টেমে যাচাই হয়েছে</div>
       <div class="r-sub">ধন্যবাদ! আবার আসবেন 🙏</div>
     </div>
     <div class="modal-actions">
-      <button class="btn small" style="background:var(--success)" onclick="downloadReceipt('png')">⬇️ Download PNG</button>
-      <button class="btn small orange" onclick="downloadReceipt('pdf')">⬇️ Download PDF</button>
-      <button class="btn small dark" onclick="window.print()">🖨️ Print</button>
-      <button class="btn small" style="background:#64748b" onclick="closeReceipt()">Close</button>
+      <button class="btn small" style="background:var(--success)" onclick="downloadReceipt('png')">⬇️ পিএনজি ডাউনলোড</button>
+      <button class="btn small orange" onclick="downloadReceipt('pdf')">⬇️ পিডিএফ ডাউনলোড</button>
+      <button class="btn small dark" onclick="window.print()">🖨️ প্রিন্ট</button>
+      <button class="btn small" style="background:#64748b" onclick="closeReceipt()">বন্ধ করুন</button>
     </div>
   </div>
 </div>
 
 <div id="dl-overlay">
   <div class="spinner"></div>
-  <div id="dl-text" style="font-weight:700;font-size:15px">Receipt তৈরি হচ্ছে...</div>
+  <div id="dl-text" style="font-weight:700;font-size:15px">রশিদ তৈরি হচ্ছে...</div>
 </div>
 
 <div id="toast-wrap"></div>
 
 <script>
-/* ================================================================
-   MODE DETECT + SHARED UTILS (দুই মোডেই লাগবে)
-================================================================ */
+/* ================= মোড নির্ণয় + শেয়ার্ড ইউটিল ================= */
 const IS_DISPLAY = new URLSearchParams(location.search).get('mode') === 'display';
 const FS_SUPPORTED = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
 const el = id => document.getElementById(id);
 
 if(IS_DISPLAY){ document.body.classList.add('display-mode'); }
 
-/* ---- 🔆 Wake Lock ---- */
+/* 🔆 Wake Lock */
 let wakeLock=null;
 async function requestWakeLock(){
   try{
@@ -826,7 +868,7 @@ document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible') requestWakeLock();
 });
 
-/* ---- 🔊 Audio Engine ---- */
+/* 🔊 অডিও */
 let audioCtx=null;
 function getAudio(){
   try{
@@ -859,8 +901,6 @@ function playPop(){
   o.connect(g); g.connect(ctx.destination);
   o.start(t); o.stop(t+0.3);
 }
-
-/* ---- 🎉 Confetti (global — display mode-ও ব্যবহার করবে) ---- */
 function launchConfetti(){
   const colors=['#2563eb','#16a34a','#f59e0b','#ef4444','#8b5cf6','#06b6d4'];
   for(let i=0;i<70;i++){
@@ -872,8 +912,6 @@ function launchConfetti(){
     setTimeout(()=>c.remove(),4000);
   }
 }
-
-/* ---- Count-up ---- */
 function countUp(elm,target){
   const t0=performance.now(), dur=1000;
   function step(t){
@@ -884,9 +922,7 @@ function countUp(elm,target){
   requestAnimationFrame(step);
 }
 
-/* ================================================================
-   🚨 SECURITY — চার্জার মনিটর (দুই ডিভাইসেই কাজ করে)
-================================================================ */
+/* 🚨 নিরাপত্তা — চার্জার মনিটর */
 let battery=null, armedCharging=null, securityOn=false, lastServerAck=0, alarmActive=false, pinBuffer='';
 async function initBattery(){
   try{
@@ -915,17 +951,6 @@ async function secCheck(){
     }
   }catch(e){}
 }
-function triggerAlarm(){
-  alarmActive=true;
-  startSiren();
-  el('alarm-overlay').classList.add('open');
-  pinBuffer=''; renderPins(); el('alarm-err').innerText='';
-}
-function stopAlarm(){
-  alarmActive=false;
-  stopSiren();
-  el('alarm-overlay').classList.remove('open');
-}
 function startSiren(){
   const ctx=getAudio(); if(!ctx) return;
   window._alarmOsc=ctx.createOscillator(); window._alarmGain=ctx.createGain();
@@ -952,6 +977,17 @@ function stopSiren(){
   if(window._vibLoop){clearInterval(window._vibLoop); navigator.vibrate(0); window._vibLoop=null;}
   window._alarmOsc=window._alarmGain=null;
 }
+function triggerAlarm(){
+  alarmActive=true;
+  startSiren();
+  el('alarm-overlay').classList.add('open');
+  pinBuffer=''; renderPins(); el('alarm-err').innerText='';
+}
+function stopAlarm(){
+  alarmActive=false;
+  stopSiren();
+  el('alarm-overlay').classList.remove('open');
+}
 function renderPins(){
   const box=el('alarm-pins');
   box.innerHTML='';
@@ -972,15 +1008,13 @@ async function pinSubmit(){
     const r = await fetch('/api/alarm_stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:pinBuffer})});
     const d = await r.json();
     if(d.status==='ok'){ stopAlarm(); lastServerAck=d.ack; }
-    else{ el('alarm-err').innerText='❌ ভুল PIN! আবার চেষ্টা করুন'; pinBuffer=''; renderPins(); }
-  }catch(e){ el('alarm-err').innerText='Network error'; }
+    else{ el('alarm-err').innerText='❌ ভুল পিন! আবার চেষ্টা করুন'; pinBuffer=''; renderPins(); }
+  }catch(e){ el('alarm-err').innerText='নেটওয়ার্ক সমস্যা'; }
 }
 setInterval(secCheck, 2000);
 initBattery();
 
-/* ================================================================
-   🖥️ DISPLAY MODE — Touch Fix + Full Screen + Poll
-================================================================ */
+/* ================= 🖥️ ডিসপ্লে মোড ================= */
 let dspActivated=false;
 async function goFullscreen(){
   try{
@@ -994,23 +1028,21 @@ async function goFullscreen(){
 }
 
 if(IS_DISPLAY){
-  /* ✅ FIX: activation-এর আগে কোনো preventDefault নেই — তাই টাচ কাজ করবে */
   el('dsp-activate').addEventListener('pointerdown', function(){
     if(dspActivated) return;
     dspActivated=true;
     el('dsp-activate').classList.add('hide');
-    getAudio();          // audio unlock (gesture-এর ভেতরে)
+    getAudio();
     requestWakeLock();
-    goFullscreen();      // ⛶ সাথে সাথে Full Screen
+    goFullscreen();
   });
 
-  /* Touch lock — শুধু activation-এর পরে; alarm PIN-এ টাচ allowed */
   document.addEventListener('touchstart', e=>{
-    if(!dspActivated) return;                 // activation screen: click যেন কাজ করে
-    if(alarmActive) return;                    // alarm PIN pad: টাচ allowed
-    e.preventDefault();                        // বাকি সব লক
+    if(!dspActivated) return;
+    if(alarmActive) return;
+    e.preventDefault();
     if(FS_SUPPORTED && !document.fullscreenElement){
-      goFullscreen();                          // যেকোনো টাচে আবার fullscreen
+      goFullscreen();
     }
   }, {passive:false});
   document.addEventListener('touchmove', e=>{
@@ -1019,7 +1051,6 @@ if(IS_DISPLAY){
   document.addEventListener('dblclick', e=>{ if(dspActivated) e.preventDefault(); });
   document.addEventListener('contextmenu', e=>e.preventDefault());
 
-  /* Fullscreen বের হলে hint দেখাও */
   document.addEventListener('fullscreenchange', ()=>{
     const hint=el('fs-hint');
     if(FS_SUPPORTED && dspActivated && !document.fullscreenElement && !alarmActive){
@@ -1030,11 +1061,11 @@ if(IS_DISPLAY){
     }
   });
 
-  /* ---- Display State Poll ---- */
-  let prevMode='idle', prevOrderId=null;
+  /* ডিসপ্লে স্টেট পোল */
+  let prevOrderId=null;
   function pollDisplay(){
     fetch('/api/display_state').then(r=>r.json()).then(st=>{
-      el('dsp-merchant').innerText = st.merchant || 'BN Enterprises';
+      el('dsp-merchant').innerText = st.merchant || 'বিএন এন্টারপ্রাইজেস';
       const scr=el('dsp-screen');
       el('dsp-idle').style.display = st.mode==='idle'?'block':'none';
       el('dsp-waiting').style.display = st.mode==='waiting'?'block':'none';
@@ -1045,10 +1076,8 @@ if(IS_DISPLAY){
         el('dsp-code').innerText=st.secret_code;
         if(prevOrderId!==st.order_id){
           el('dsp-qr').innerHTML='';
-          el('dsp-qr').dataset.oid=st.order_id;
           prevOrderId=st.order_id;
           new QRCode(el('dsp-qr'),{text:st.upi_url,width:230,height:230,correctLevel:QRCode.CorrectLevel.M});
-          /* 🎬 QR generate হওয়ার সাথে সাথে animation */
           countUp(el('dsp-amount'), Number(st.amount));
           playPop();
           launchConfetti();
@@ -1057,33 +1086,21 @@ if(IS_DISPLAY){
 
       if(st.mode==='success' && prevOrderId!=='S'+st.order_id){
         prevOrderId='S'+st.order_id;
-        el('dsp-payer').innerText = st.payer || 'Customer';
+        el('dsp-payer').innerText = st.payer || 'কাস্টমার';
         el('dsp-time').innerText = st.time || '';
         countUp(el('dsp-amt2'), Number(st.amount));
         playDing();
         launchConfetti();
       }
       if(st.mode==='idle'){ prevOrderId=null; }
-      prevMode=st.mode;
     }).catch(()=>{});
   }
   setInterval(pollDisplay, 1200);
   pollDisplay();
 }
 
-/* ================================================================
-   ⛽ POS MODE
-================================================================ */
+/* ================= ⛽ কাউন্টার মোড ================= */
 let pollTimer=null, timerInt=null, timeLeft=300, lastRecord=null, historyData=[], gmailOK=false, currentOrderId=null, statusFilter='ALL', currentReceiptRec=null;
-
-const REASONS={
-  no_emails:'কোনো নতুন ইমেইল পাওয়া যায়নি — Gmail-এ FamPay/ব্যাংকের মেইল এসেছে কিনা দেখুন',
-  no_code_match:'ইমেইলে FP কোড পাওয়া যায়নি — Settings-এ Strict Mode বন্ধ করুন',
-  no_amount_match:'অ্যামাউন্ট ম্যাচ হয়নি এখনো',
-  email_used:'ইমেইল অন্য অর্ডারে ব্যবহৃত হয়েছে',
-  too_old:'ইমেইলটি অর্ডারের আগের — বাদ',
-  no_match:'অপেক্ষা চলছে...'
-};
 
 if(!IS_DISPLAY){
   function updateClock(){ el('clock').innerText = new Date().toLocaleTimeString('en-IN',{hour12:true}); }
@@ -1112,11 +1129,11 @@ if(!IS_DISPLAY){
       const badge=el('email-status-badge'), lock=el('lock-msg');
       if(gmailOK){
         badge.className='badge badge-online';
-        badge.innerHTML='<span class="live-dot"></span> Gmail Connected';
+        badge.innerHTML='<span class="live-dot"></span> জিমেইল কানেক্টেড';
         lock.style.display='none';
       }else{
         badge.className='badge badge-offline';
-        badge.innerHTML='<span class="live-dot" style="background:#f87171"></span> Gmail Offline';
+        badge.innerHTML='<span class="live-dot" style="background:#f87171"></span> জিমেইল কানেক্টেড নেই';
         lock.style.display='block'; lock.innerText='⚠️ '+d.message;
       }
       validateAmount();
@@ -1142,7 +1159,7 @@ if(!IS_DISPLAY){
     .then(r=>r.json()).then(d=>{
       el('hdr-merchant').innerText=el('merchant-input').value;
       showToast(d.message,'success');
-    }).catch(()=>showToast('Save failed!','error'));
+    }).catch(()=>showToast('সেভ করা যায়নি!','error'));
   }
 
   function setAmount(v){ el('pay-amount').value=v; validateAmount(); }
@@ -1152,7 +1169,7 @@ if(!IS_DISPLAY){
   }
   function generateQR(){
     const amt=parseFloat(el('pay-amount').value);
-    if(!amt||amt<=0) return showToast('সঠিক অ্যামাউন্ট লিখুন!','error');
+    if(!amt||amt<=0) return showToast('সঠিক টাকার পরিমাণ লিখুন!','error');
     fetch(`/api/create_order?amount=${amt}`)
       .then(r=>r.json()).then(d=>{
         if(d.status==='error'){ showToast(d.message,'error'); return; }
@@ -1161,32 +1178,25 @@ if(!IS_DISPLAY){
         el('payment-view').style.display='block';
         el('pay-active').style.display='block';
         el('pay-success').style.display='none';
-        el('order-info').innerText=`Total: ₹${Number(d.amount).toFixed(2)}`;
+        el('order-info').innerText=`মোট: ₹${Number(d.amount).toFixed(2)}`;
         el('secret-code-display').innerText=d.secret_code;
         el('qr-box').innerHTML='';
-        el('verify-hint').innerText='';
         el('payment-status').className='status-pill status-waiting';
         el('payment-status').innerHTML='<span class="dots"><span></span><span></span><span></span></span> ব্যাংক কনফার্মেশনের অপেক্ষায়...';
         new QRCode(el('qr-box'),{text:d.upi_url,width:200,height:200,correctLevel:QRCode.CorrectLevel.M});
         startPolling(d.order_id);
-      }).catch(()=>showToast('Order create failed!','error'));
+      }).catch(()=>showToast('বিল তৈরি করা যায়নি!','error'));
   }
 
   function startPolling(orderId){
     stopPolling();
     timeLeft=300; updateTimer();
-    const waitStart=Date.now();
     timerInt=setInterval(()=>{ timeLeft--; updateTimer(); if(timeLeft<=0){ stopPolling(); showExpired(); } },1000);
     pollTimer=setInterval(()=>{
       fetch(`/api/verify_order?order_id=${orderId}`).then(r=>r.json()).then(d=>{
-        if(d.status==='success'){ el('verify-hint').innerText=''; onVerified(d.record); }
+        if(d.status==='success') onVerified(d.record);
         else if(d.status==='expired'){ stopPolling(); showExpired(); }
         else if(d.status==='cancelled'){ stopPolling(); resetQRView(); }
-        else {
-          if(Date.now()-waitStart>10000 && d.reason){
-            el('verify-hint').innerText='ℹ️ '+(REASONS[d.reason]||'অপেক্ষা চলছে...');
-          }
-        }
       }).catch(()=>{});
     },1500);
   }
@@ -1196,12 +1206,12 @@ if(!IS_DISPLAY){
     bar.style.width=(timeLeft/300*100)+'%';
     bar.classList.toggle('low',timeLeft<60);
     const m=Math.floor(timeLeft/60), s=timeLeft%60;
-    el('timer-text').innerText=`Expires in ${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    el('timer-text').innerText=`মেয়াদ শেষ হবে ${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
   }
   function showExpired(){
     const st=el('payment-status');
     st.className='status-pill status-expired';
-    st.innerText='⏰ Order expired! Dashboard-এ EXPIRED হিসেবে দেখা যাবে।';
+    st.innerText='⏰ বিলের মেয়াদ শেষ! ড্যাশবোর্ডে দেখা যাবে।';
   }
 
   function cancelOrder(){
@@ -1209,9 +1219,9 @@ if(!IS_DISPLAY){
     fetch(`/api/cancel_order?order_id=${currentOrderId}`)
       .then(r=>r.json()).then(d=>{
         stopPolling();
-        if(d.status==='success'){ showToast('❌ Order Cancelled — Dashboard-এ দেখা যাবে','error'); }
+        if(d.status==='success'){ showToast('❌ বিল বাতিল হয়েছে — ড্যাশবোর্ডে দেখা যাবে','error'); }
         resetQRView();
-      }).catch(()=>showToast('Cancel failed!','error'));
+      }).catch(()=>showToast('বাতিল করা যায়নি!','error'));
   }
 
   function onVerified(rec){
@@ -1219,7 +1229,7 @@ if(!IS_DISPLAY){
     el('pay-active').style.display='none';
     el('pay-success').style.display='block';
 
-    const payer = rec.payer || 'Customer';
+    const payer = rec.payer || 'কাস্টমার';
     const amt = Number(rec.amount);
 
     el('thank-name').innerText = payer;
@@ -1227,7 +1237,7 @@ if(!IS_DISPLAY){
     el('thank-time').innerText = rec.time || new Date().toLocaleTimeString('en-IN',{hour12:true});
 
     el('success-details').innerHTML=`
-      <div style="font-size:13px;color:var(--muted);margin-bottom:10px;">UTR: <span class="code-tag">${rec.utr}</span></div>`;
+      <div style="font-size:13px;color:var(--muted);margin-bottom:10px;">ইউটিআর: <span class="code-tag">${rec.utr}</span></div>`;
 
     playDing(); launchConfetti(); blinkTitle();
     loadStats(); loadHistory();
@@ -1236,16 +1246,16 @@ if(!IS_DISPLAY){
   function blinkTitle(){
     let n=0;
     const t=setInterval(()=>{
-      document.title = n%2===0 ? '✅ Payment Received!' : 'BN Enterprises - Fuel POS';
-      if(++n>6){ clearInterval(t); document.title='BN Enterprises - Fuel POS'; }
+      document.title = n%2===0 ? '✅ পেমেন্ট পাওয়া গেছে!' : 'বিএন এন্টারপ্রাইজেস';
+      if(++n>6){ clearInterval(t); document.title='বিএন এন্টারপ্রাইজেস'; }
     },600);
   }
   function resetQRView(){
     stopPolling(); currentOrderId=null;
+    fetch('/api/clear_current').catch(()=>{});   /* 🆕 ডিসপ্লে আবার বাবলে ফিরবে */
     el('payment-view').style.display='none';
     el('create-view').style.display='block';
     el('pay-amount').value='';
-    el('verify-hint').innerText='';
     validateAmount();
   }
 
@@ -1256,9 +1266,9 @@ if(!IS_DISPLAY){
     });
   }
   function statusPill(s){
-    if(s==='SUCCESS') return '<span class="st st-success">✅ SUCCESS</span>';
-    if(s==='CANCELLED') return '<span class="st st-cancelled">❌ CANCELLED</span>';
-    if(s==='EXPIRED') return '<span class="st st-expired">⏰ EXPIRED</span>';
+    if(s==='SUCCESS') return '<span class="st st-success">✅ সফল</span>';
+    if(s==='CANCELLED') return '<span class="st st-cancelled">❌ বাতিল</span>';
+    if(s==='EXPIRED') return '<span class="st st-expired">⏰ মেয়াদ শেষ</span>';
     return '<span class="st">'+s+'</span>';
   }
   function setFilter(f,btn){ statusFilter=f; document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active')); btn.classList.add('active'); renderTable(); }
@@ -1273,10 +1283,10 @@ if(!IS_DISPLAY){
         || (t.payer||'').toLowerCase().includes(q);
     });
     const tb=el('history-body');
-    if(!rows.length){ tb.innerHTML='<tr><td colspan="7" class="empty-row">'+(q?'কোনো ম্যাচ পাওয়া যায়নি':'No transactions yet')+'</td></tr>'; return; }
+    if(!rows.length){ tb.innerHTML='<tr><td colspan="7" class="empty-row">'+(q?'কিছু পাওয়া যায়নি':'এখনো কোনো লেনদেন নেই')+'</td></tr>'; return; }
     tb.innerHTML=[...rows].reverse().map(t=>{
       const idx=historyData.indexOf(t);
-      return `<tr onclick='showReceipt(historyData[${idx}])' title="Receipt দেখতে/Download করতে ক্লিক করুন">
+      return `<tr onclick='showReceipt(historyData[${idx}])' title="রশিদ দেখতে ক্লিক করুন">
         <td><b>${t.order_id}</b></td>
         <td><span class="code-tag">${t.secret_code}</span></td>
         <td>₹${Number(t.amount).toFixed(2)}</td>
@@ -1290,7 +1300,7 @@ if(!IS_DISPLAY){
   function renderRecent(){
     const box=el('recent-list');
     const last=[...historyData].slice(-4).reverse();
-    if(!last.length){ box.innerHTML='<div style="color:var(--muted);font-size:13.5px;text-align:center;padding:14px">No verified transactions yet</div>'; return; }
+    if(!last.length){ box.innerHTML='<div style="color:var(--muted);font-size:13.5px;text-align:center;padding:14px">এখনো কোনো পেমেন্ট হয়নি</div>'; return; }
     box.innerHTML=last.map(t=>`
       <div class="mini-item">
         <div><span class="code-tag">${t.secret_code}</span> <b style="margin-left:8px">₹${Number(t.amount).toFixed(2)}</b></div>
@@ -1304,7 +1314,7 @@ if(!IS_DISPLAY){
     const chart=el('chart');
     const success=historyData.filter(t=>(t.status||'SUCCESS')==='SUCCESS');
     const last=success.slice(-8);
-    if(!last.length){ chart.innerHTML='<div style="color:var(--muted);font-size:13px">No data yet</div>'; return; }
+    if(!last.length){ chart.innerHTML='<div style="color:var(--muted);font-size:13px">এখনো ডেটা নেই</div>'; return; }
     const max=Math.max(...last.map(t=>Number(t.amount)),1);
     chart.innerHTML=last.map(t=>{
       const v=Number(t.amount);
@@ -1330,8 +1340,8 @@ if(!IS_DISPLAY){
       animateNum(el('stat-avg'),d.avg_sale);
       animateNum(el('stat-cancelled'),d.cancelled_expired,'');
       animateNum(el('stat-rate'),d.success_rate,'','%' );
-      el('stat-today-count').innerText=`Today's Sales — ${d.today_count} txn`;
-      el('stat-cancelled-sub').innerText=`Cancelled ${d.cancelled_count} · Expired ${d.expired_count}`;
+      el('stat-today-count').innerText=`আজকের বিক্রি — ${d.today_count} টি`;
+      el('stat-cancelled-sub').innerText=`বাতিল ${d.cancelled_count} · মেয়াদ শেষ ${d.expired_count}`;
     });
   }
 
@@ -1341,7 +1351,7 @@ if(!IS_DISPLAY){
     el('r-merchant').innerText=el('merchant-input').value;
     el('r-order').innerText=rec.order_id;
     el('r-code').innerText=rec.secret_code;
-    el('r-payer').innerText=rec.payer||'UPI Customer';
+    el('r-payer').innerText=rec.payer||'ইউপিআই কাস্টমার';
     el('r-utr').innerText=(rec.status||'SUCCESS')==='SUCCESS'? rec.utr : '—';
     el('r-date').innerText=rec.date||'—';
     el('r-time').innerText=rec.time;
@@ -1351,14 +1361,14 @@ if(!IS_DISPLAY){
   function closeReceipt(){ el('receipt-modal').classList.remove('open'); }
 
   async function downloadReceipt(type){
-    if(!currentReceiptRec) return showToast('আগে একটা Receipt খুলুন!','error');
+    if(!currentReceiptRec) return showToast('আগে একটা রশিদ খুলুন!','error');
     const node = el('receipt-print');
     const rec = currentReceiptRec;
-    const fname = `Receipt_${rec.order_id}_${rec.secret_code}`;
+    const fname = `Rashid_${rec.order_id}_${rec.secret_code}`;
     const overlay = el('dl-overlay'), dlText = el('dl-text');
 
     overlay.classList.add('open');
-    dlText.innerText = type==='pdf' ? 'PDF তৈরি হচ্ছে...' : 'Image তৈরি হচ্ছে...';
+    dlText.innerText = type==='pdf' ? 'পিডিএফ তৈরি হচ্ছে...' : 'ছবি তৈরি হচ্ছে...';
 
     try{
       const modal = el('receipt-modal');
@@ -1371,7 +1381,7 @@ if(!IS_DISPLAY){
         a.href = canvas.toDataURL('image/png');
         a.download = fname + '.png';
         document.body.appendChild(a); a.click(); a.remove();
-        showToast('✅ PNG Downloaded!','success');
+        showToast('✅ পিএনজি ডাউনলোড হয়েছে!','success');
       } else {
         const { jsPDF } = window.jspdf;
         const pdf = new jsPDF('p','mm','a5');
@@ -1383,18 +1393,17 @@ if(!IS_DISPLAY){
         const finalH = Math.min(imgH, pageH - margin*2);
         pdf.addImage(canvas.toDataURL('image/jpeg',0.95),'JPEG',margin,margin,imgW,finalH);
         pdf.save(fname + '.pdf');
-        showToast('✅ PDF Downloaded!','success');
+        showToast('✅ পিডিএফ ডাউনলোড হয়েছে!','success');
       }
     }catch(e){
       console.error(e);
       el('receipt-modal').style.visibility='visible';
-      showToast('❌ Download failed!','error');
+      showToast('❌ ডাউনলোড করা যায়নি!','error');
     }finally{
       overlay.classList.remove('open');
     }
   }
 
-  /* Init POS */
   checkEmailStatus(); loadHistory(); loadStats(); validateAmount(); syncSecurityToggle();
   setInterval(()=>{ if(el('tab-dash').classList.contains('active')) loadStats(); },10000);
   document.addEventListener('pointerdown', function once(){ requestWakeLock(); document.removeEventListener('pointerdown',once); });
@@ -1425,8 +1434,9 @@ def api_update_settings():
         CONFIG["STRICT_CODE"] = bool(data["strict"])
     if "security" in data:
         CONFIG["SECURITY_SWITCH"] = bool(data["security"])
-    return jsonify({"status": "success", "message": "✅ Settings updated successfully!"})
+    return jsonify({"status": "success", "message": "✅ সেটিংস সেভ হয়েছে!"})
 
+# 🚨 নিরাপত্তা
 @app.route('/api/security')
 def api_security():
     return jsonify({"security": CONFIG["SECURITY_SWITCH"], "ack": ALARM_ACK})
@@ -1440,40 +1450,55 @@ def api_alarm_stop():
         CONFIG["SECURITY_SWITCH"] = False
         ALARM_ACK += 1
         return jsonify({"status": "ok", "ack": ALARM_ACK})
-    return jsonify({"status": "error", "message": "ভুল PIN"}), 401
+    return jsonify({"status": "error", "message": "ভুল পিন"}), 401
 
+# 🖥️ ডিসপ্লে স্টেট — 💾 ফাইল থেকে পড়ে (cross-device sync)
 @app.route('/api/display_state')
 def api_display_state():
-    cleanup_expired_orders()
+    cur, orders, uu, ue = read_orders()
+    changed, recs = cleanup_orders_dict(orders)
+    if changed:
+        write_orders(cur, orders, uu, ue)
+        append_history(recs)
+
     st = {
         "mode": "idle",
         "merchant": CONFIG["MERCHANT_NAME"],
         "order_id": None, "amount": 0, "secret_code": "", "upi_url": "",
         "payer": None, "utr": "", "time": ""
     }
-    if CURRENT_ORDER_ID and CURRENT_ORDER_ID in ACTIVE_ORDERS:
-        o = ACTIVE_ORDERS[CURRENT_ORDER_ID]
-        st["order_id"] = CURRENT_ORDER_ID
+    o = orders.get(cur) if cur else None
+    if o:
+        st["order_id"] = cur
         st["amount"] = float(o["amount"])
         st["secret_code"] = o["secret_code"]
         if o["status"] == "PENDING":
             st["mode"] = "waiting"
             st["upi_url"] = (f"upi://pay?pa={quote(CONFIG['UPI_ID'])}"
                              f"&pn={quote(CONFIG['MERCHANT_NAME'])}"
-                             f"&am={o['amount']}&cu=INR&tn={o['secret_code']}&tr={CURRENT_ORDER_ID}")
-        elif o["status"] == "SUCCESS" and o.get("record"):
-            rec = o["record"]
-            st["mode"] = "success"
-            st["payer"] = rec.get("payer")
-            st["utr"] = rec.get("utr", "")
-            st["time"] = rec.get("time", "")
-        elif o["status"] == "CANCELLED":
-            st["mode"] = "idle"
+                             f"&am={o['amount']}&cu=INR&tn={o['secret_code']}&tr={cur}")
+        elif o["status"] == "SUCCESS":
+            # ২০ সেকেন্ড পর অটো বাবলে ফেরা
+            if time.time() - o.get("success_at", 0) < SUCCESS_SHOW_SEC:
+                rec = o.get("record") or {}
+                st["mode"] = "success"
+                st["payer"] = rec.get("payer")
+                st["utr"] = rec.get("utr", "")
+                st["time"] = rec.get("time", "")
+            else:
+                st["mode"] = "idle"
     return jsonify(st)
+
+# 💾 "নতুন বিল" — ডিসপ্লে রিসেট
+@app.route('/api/clear_current')
+def api_clear_current():
+    cur, orders, uu, ue = read_orders()
+    if cur is not None:
+        write_orders(None, orders, uu, ue)
+    return jsonify({"status": "ok"})
 
 @app.route('/api/create_order')
 def api_create_order():
-    global CURRENT_ORDER_ID
     ok, msg = test_gmail_connection()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 400
@@ -1481,13 +1506,16 @@ def api_create_order():
     try:
         amt = round(float(request.args.get("amount", 0)), 2)
     except (TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Invalid amount"}), 400
+        return jsonify({"status": "error", "message": "ভুল টাকার পরিমাণ"}), 400
     if amt < 1 or amt > 100000:
-        return jsonify({"status": "error", "message": "Amount must be ₹1 – ₹1,00,000"}), 400
+        return jsonify({"status": "error", "message": "টাকা ₹1 – ₹1,00,000 এর মধ্যে হতে হবে"}), 400
 
-    cleanup_expired_orders()
+    cur, orders, uu, ue = read_orders()
+    changed, recs = cleanup_orders_dict(orders)
+    if changed:
+        append_history(recs)
 
-    pending_codes = {o["secret_code"] for o in ACTIVE_ORDERS.values() if o["status"] == "PENDING"}
+    pending_codes = {o["secret_code"] for o in orders.values() if o.get("status") == "PENDING"}
     while True:
         code = "FP" + str(random.randint(100000, 999999))
         if code not in pending_codes:
@@ -1498,13 +1526,13 @@ def api_create_order():
                f"&pn={quote(CONFIG['MERCHANT_NAME'])}"
                f"&am={amt}&cu=INR&tn={code}&tr={order_id}")
 
-    ACTIVE_ORDERS[order_id] = {
+    orders[order_id] = {
         "amount": amt,
         "secret_code": code,
         "status": "PENDING",
         "created_at": time.time()
     }
-    CURRENT_ORDER_ID = order_id
+    write_orders(order_id, orders, uu, ue)   # 💾 ফাইলে সেভ — সব device দেখবে
     return jsonify({
         "order_id": order_id,
         "secret_code": code,
@@ -1515,10 +1543,10 @@ def api_create_order():
 @app.route('/api/verify_order')
 def api_verify_order():
     order_id = request.args.get('order_id', '')
-    if order_id not in ACTIVE_ORDERS:
-        return jsonify({"status": "error", "message": "Order not found"}), 404
-
-    order = ACTIVE_ORDERS[order_id]
+    cur, orders, uu, ue = read_orders()
+    order = orders.get(order_id)
+    if not order:
+        return jsonify({"status": "error", "message": "অর্ডার পাওয়া যায়নি"}), 404
 
     if order["status"] == "SUCCESS":
         return jsonify({"status": "success", "record": order.get("record")})
@@ -1526,15 +1554,18 @@ def api_verify_order():
     if order["status"] == "CANCELLED":
         return jsonify({"status": "cancelled"})
 
-    cleanup_expired_orders()
+    changed, recs = cleanup_orders_dict(orders)
+    if changed:
+        write_orders(cur, orders, uu, ue)
+        append_history(recs)
     if order["status"] == "EXPIRED":
         return jsonify({"status": "expired"})
 
     strict = CONFIG.get("STRICT_CODE", False)
     verified, utr, payer, reason = verify_payment_mail(
-        order["secret_code"], order["amount"], order["created_at"], strict)
+        order["secret_code"], order["amount"], order["created_at"], strict, ue)
 
-    if verified and utr not in USED_UTRS:
+    if verified and utr not in uu:
         now = datetime.datetime.now()
         record = {
             "order_id": order_id,
@@ -1548,27 +1579,29 @@ def api_verify_order():
         }
         order["status"] = "SUCCESS"
         order["record"] = record
-        USED_UTRS.add(utr)
-        PAYMENT_HISTORY.append(record)
-        save_history()
+        order["success_at"] = time.time()
+        uu.add(utr)
+        write_orders(cur, orders, uu, ue)   # 💾 সেভ — ডিসপ্লে সাথে সাথে দেখবে
+        append_history([record])
         return jsonify({"status": "success", "record": record})
 
     if not verified:
         _log_debug(order_id, reason)
 
-    return jsonify({"status": "waiting", "reason": reason})
+    return jsonify({"status": "waiting"})
 
 @app.route('/api/cancel_order')
 def api_cancel_order():
     order_id = request.args.get('order_id', '')
-    if order_id not in ACTIVE_ORDERS:
-        return jsonify({"status": "error", "message": "Order not found"}), 404
+    cur, orders, uu, ue = read_orders()
+    order = orders.get(order_id)
+    if not order:
+        return jsonify({"status": "error", "message": "অর্ডার পাওয়া যায়নি"}), 404
 
-    order = ACTIVE_ORDERS[order_id]
     if order["status"] == "SUCCESS":
-        return jsonify({"status": "error", "message": "Order already paid! Cancel করা যাবে না।"}), 400
+        return jsonify({"status": "error", "message": "পেমেন্ট হয়ে গেছে! বাতিল করা যাবে না।"}), 400
     if order["status"] != "PENDING":
-        return jsonify({"status": "error", "message": "Order already cancelled/expired"}), 400
+        return jsonify({"status": "error", "message": "অর্ডার ইতিমধ্যে বাতিল/মেয়াদ শেষ"}), 400
 
     order["status"] = "CANCELLED"
     now = datetime.datetime.now()
@@ -1583,24 +1616,25 @@ def api_cancel_order():
         "date": now.strftime("%Y-%m-%d")
     }
     order["record"] = record
-    PAYMENT_HISTORY.append(record)
-    save_history()
-    return jsonify({"status": "success", "message": "Order cancelled"})
+    write_orders(cur if cur != order_id else None, orders, uu, ue)
+    append_history([record])
+    return jsonify({"status": "success", "message": "বিল বাতিল হয়েছে"})
 
 @app.route('/api/history')
 def api_history():
-    return jsonify(PAYMENT_HISTORY)
+    return jsonify(get_history())
 
 @app.route('/api/stats')
 def api_stats():
+    hist = get_history()
     today = datetime.date.today().strftime("%Y-%m-%d")
-    success_tx = [t for t in PAYMENT_HISTORY if t.get("status") == "SUCCESS"]
+    success_tx = [t for t in hist if t.get("status") == "SUCCESS"]
     today_tx = [t for t in success_tx if t.get("date") == today]
     today_sum = sum(float(t["amount"]) for t in today_tx)
     total_sum = sum(float(t["amount"]) for t in success_tx)
-    cancelled_count = len([t for t in PAYMENT_HISTORY if t.get("status") == "CANCELLED"])
-    expired_count = len([t for t in PAYMENT_HISTORY if t.get("status") == "EXPIRED"])
-    total_orders = len(PAYMENT_HISTORY)
+    cancelled_count = len([t for t in hist if t.get("status") == "CANCELLED"])
+    expired_count = len([t for t in hist if t.get("status") == "EXPIRED"])
+    total_orders = len(hist)
     return jsonify({
         "today_sales": round(today_sum, 2),
         "today_count": len(today_tx),
@@ -1617,8 +1651,8 @@ def api_stats():
 def api_export():
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Order ID", "Code", "Amount", "Status", "Payer Name", "UTR", "Date", "Time"])
-    for t in PAYMENT_HISTORY:
+    writer.writerow(["অর্ডার আইডি", "কোড", "টাকা", "অবস্থা", "নাম", "ইউটিআর", "তারিখ", "সময়"])
+    for t in get_history():
         writer.writerow([t["order_id"], t["secret_code"], t["amount"], t.get("status", "SUCCESS"),
                          t.get("payer", ""), t.get("utr", ""), t.get("date", ""), t["time"]])
     return Response(
@@ -1627,6 +1661,7 @@ def api_export():
         headers={"Content-Disposition": "attachment; filename=transactions.csv"}
     )
 
+# ================= ডিবাগ =================
 @app.route('/api/debug/emails')
 def api_debug_emails():
     emails = get_recent_emails()
