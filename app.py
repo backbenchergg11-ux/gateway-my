@@ -22,7 +22,7 @@ CONFIG = {
     "GMAIL_PASS": "cjmjsbslgwdzbfrw",
     "UPI_ID": "tanmaykundu439@yesfam",
     "MERCHANT_NAME": "BN Enterprises",
-    "STRICT_CODE": False,       # 🔓 False = Relaxed (কোড না থাকলেও amount+time মিললে verify)
+    "STRICT_CODE": False,       # 🔓 False = Relaxed mode
     "SECURITY_SWITCH": False,   # 🚨 Anti-theft charger alarm
     "SECURITY_PIN": "1234"
 }
@@ -32,8 +32,8 @@ ACTIVE_ORDERS = {}
 USED_UTRS = set()
 USED_EMAIL_IDS = set()
 DEBUG_LOG = []
-CURRENT_ORDER_ID = None      # 🆕 Display ডিভাইসের জন্য latest order
-ALARM_ACK = 0                # 🆕 Alarm stop counter
+CURRENT_ORDER_ID = None
+ALARM_ACK = 0
 
 ORDER_TIMEOUT = 300
 EMAIL_FETCH_COUNT = 15
@@ -41,7 +41,7 @@ EMAIL_LOOKBACK_MIN = 30
 HISTORY_FILE = "payment_history.json"
 
 _gmail_lock = threading.Lock()
-_imap = None                 # 🆕 সবসময় alive কানেকশন (speed-এর মূল চাবি)
+_imap = None
 _email_cache = []
 _last_fetch = 0
 
@@ -68,13 +68,12 @@ def load_history():
                 t.setdefault("status", "SUCCESS")
                 t.setdefault("payer", None)
                 t.setdefault("date", "")
-                t.setdefault("manual", False)
     except Exception:
         pass
 
 load_history()
 
-# ================= ⚡ Persistent Gmail কানেকশন (Speed Boost) =================
+# ================= ⚡ Persistent Gmail কানেকশন =================
 def _get_imap():
     global _imap
     if _imap is not None:
@@ -92,7 +91,6 @@ def _get_imap():
     _imap = m
     return m
 
-# ================= ইমেইল বডি পার্সার =================
 def _parse_body(msg):
     body = ""
     if msg.is_multipart():
@@ -131,7 +129,7 @@ def _decode_subject(msg):
     except Exception:
         return str(msg.get("Subject", ""))
 
-# ================= 🆕 Background Email Poller (২ সেকেন্ড পরপর) =================
+# ================= 🆕 Background Email Poller =================
 def _fetch_emails_once():
     global _email_cache, _last_fetch, _imap
     try:
@@ -161,7 +159,6 @@ def _fetch_emails_once():
         return False
 
 def email_poller():
-    # প্রথমে সাথে সাথে একবার, তারপর প্রতি ২ সেকেন্ডে
     while True:
         ok = _fetch_emails_once()
         time.sleep(2 if ok else 3)
@@ -174,12 +171,11 @@ def get_recent_emails():
 def test_gmail_connection():
     if _last_fetch and (time.time() - _last_fetch) < 25:
         return True, "Gmail Connected & Active"
-    # কখনো fetch হয়নি হলে sync একবার চেষ্টা
     if _fetch_emails_once():
         return True, "Gmail Connected & Active"
     return False, "Gmail Connection Error — কিছুক্ষণ পরে আবার দেখুন"
 
-# ================= Payer Name Extractor (FamPay + সব ব্যাংক) =================
+# ================= Payer Name Extractor =================
 def extract_payer_name(subject, body):
     text = re.sub(r"\s+", " ", f"{subject} {body}")
     text = text.replace("*", " ").replace("#", " ").replace("_", " ")
@@ -232,7 +228,7 @@ def _is_recent_mail(msg):
     except Exception:
         return True
 
-# ================= পেমেন্ট ভেরিফিকেশন (ক্যাশ থেকে — instant) =================
+# ================= পেমেন্ট ভেরিফিকেশন =================
 def verify_payment_mail(secret_code, expected_amount, created_at=None, strict=True):
     emails = get_recent_emails()
     target = str(secret_code).strip().lower()
@@ -335,7 +331,10 @@ HTML_TEMPLATE = """
 <html lang="bn">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>BN Enterprises - Fuel POS Terminal</title>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -433,13 +432,28 @@ body.display-mode #pos-app{display:none}
 
 .dsp-screen{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#fff;padding:24px;background:linear-gradient(-45deg,#064e3b,#059669,#10b981,#047857);background-size:400% 400%;animation:gradientShift 10s ease infinite;transition:.4s}
 .dsp-screen.idle{background:linear-gradient(-45deg,#1e293b,#334155,#475569,#334155);background-size:400% 400%}
-.dsp-idle-logo{font-size:60px;animation:floatY 3s ease-in-out infinite}
-.dsp-idle-txt{font-size:22px;font-weight:700;opacity:.85;margin-top:12px}
+.dsp-merchant{position:fixed;top:20px;left:0;right:0;text-align:center;font-size:15px;font-weight:800;opacity:.8;letter-spacing:1px;pointer-events:none;z-index:5}
 
-.dsp-amount{font-size:70px;font-weight:900;text-shadow:0 6px 24px rgba(0,0,0,.3);font-variant-numeric:tabular-nums}
-.dsp-qr{background:#fff;padding:16px;border-radius:18px;margin:18px 0;animation:qrPop .6s cubic-bezier(.34,1.56,.64,1);box-shadow:0 16px 40px rgba(0,0,0,.3)}
-.dsp-code{font-size:16px;font-weight:700;opacity:.9}
-.dsp-wait{margin-top:14px;font-size:16px;font-weight:600;display:flex;align-items:center;gap:10px;opacity:.95}
+/* 🫧 Waiting-for-bill Bubble Animation */
+.bubble-wrap{position:relative;width:130px;height:130px;margin-bottom:8px}
+.bubble{position:absolute;border-radius:50%;animation:bubbleFloat 4s ease-in-out infinite}
+.b1{width:112px;height:112px;left:9px;top:9px;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.16)}
+.b2{width:42px;height:42px;right:-6px;top:-2px;background:rgba(74,222,128,.16);border:1px solid rgba(74,222,128,.35);animation-delay:.8s}
+.b3{width:26px;height:26px;left:-4px;bottom:8px;background:rgba(96,165,250,.2);border:1px solid rgba(96,165,250,.4);animation-delay:1.6s}
+.b4{width:16px;height:16px;right:14px;bottom:-4px;background:rgba(251,191,36,.22);border:1px solid rgba(251,191,36,.4);animation-delay:2.2s}
+.dsp-idle-logo{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:54px;animation:floatY 3s ease-in-out infinite;z-index:2}
+.dsp-idle-txt{font-size:25px;font-weight:800;margin-top:16px}
+.dsp-idle-sub{font-size:14px;opacity:.6;margin-top:7px;font-weight:600}
+.dsp-idle-pulse{display:flex;gap:9px;margin-top:24px}
+.dsp-idle-pulse span{width:11px;height:11px;border-radius:50%;background:rgba(255,255,255,.75);animation:bounceDot 1.2s infinite}
+.dsp-idle-pulse span:nth-child(2){animation-delay:.15s}
+.dsp-idle-pulse span:nth-child(3){animation-delay:.3s}
+@keyframes bubbleFloat{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-14px) scale(1.07)}}
+
+.dsp-amount{font-size:70px;font-weight:900;text-shadow:0 6px 24px rgba(0,0,0,.3);font-variant-numeric:tabular-nums;animation:fadeInUp .5s ease}
+.dsp-qr{background:#fff;padding:16px;border-radius:18px;margin:16px 0;animation:qrPop .65s cubic-bezier(.34,1.56,.64,1);box-shadow:0 16px 40px rgba(0,0,0,.35)}
+.dsp-code{font-size:16px;font-weight:700;opacity:.9;animation:fadeInUp .6s .2s ease both}
+.dsp-wait{margin-top:14px;font-size:16px;font-weight:600;display:flex;align-items:center;gap:10px;opacity:.95;animation:fadeInUp .6s .35s ease both}
 
 .dsp-check{font-size:76px;margin-bottom:6px;animation:cdPop .7s cubic-bezier(.34,1.56,.64,1)}
 .dsp-thanks{font-size:34px;font-weight:900}
@@ -448,9 +462,9 @@ body.display-mode #pos-app{display:none}
 .dsp-msg{font-size:19px;font-weight:600;opacity:.92}
 .dsp-amt2{font-size:64px;font-weight:900;margin:16px 0 4px;font-variant-numeric:tabular-nums;animation:cdPop .8s .5s cubic-bezier(.34,1.56,.64,1) both;text-shadow:0 6px 24px rgba(0,0,0,.3)}
 .dsp-time{font-size:17px;font-weight:600;opacity:.9}
-.dsp-merchant{position:fixed;top:20px;left:0;right:0;text-align:center;font-size:15px;font-weight:800;opacity:.8;letter-spacing:1px;pointer-events:none}
 
 .wl-indicator{position:fixed;top:14px;right:14px;background:rgba(0,0,0,.35);color:#fff;font-size:11px;font-weight:700;padding:6px 12px;border-radius:9999px;z-index:10040;pointer-events:none}
+#fs-hint{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.55);color:#fff;font-size:12.5px;font-weight:700;padding:10px 20px;border-radius:9999px;z-index:10060;display:none}
 
 @keyframes cdPop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.12)}100%{transform:scale(1);opacity:1}}
 
@@ -548,15 +562,24 @@ tbody tr:hover{background:#f8fafc}
     <div class="dsp-name">{{ config.MERCHANT_NAME }}</div>
     <div style="font-size:14px;opacity:.7">Customer Payment Display</div>
     <div class="dsp-tap">👆 চালু করতে একবার টাচ করুন</div>
-    <div style="font-size:12px;opacity:.6">স্ক্রিন সবসময় জ্বলজ্বল থাকবে · টাচ লক সক্রিয়</div>
+    <div style="font-size:12px;opacity:.6">Full Screen · স্ক্রিন সবসময় জ্বলজ্বল · টাচ লক</div>
   </div>
 
   <div class="dsp-screen idle" id="dsp-screen">
     <div class="dsp-merchant" id="dsp-merchant">{{ config.MERCHANT_NAME }}</div>
 
+    <!-- 🫧 Idle: waiting-for-bill bubbles -->
     <div id="dsp-idle">
-      <div class="dsp-idle-logo">⛽</div>
-      <div class="dsp-idle-txt">নতুন বিলের অপেক্ষায়...<br><span style="font-size:14px;opacity:.6">Waiting for new bill</span></div>
+      <div class="bubble-wrap">
+        <div class="bubble b1"></div>
+        <div class="bubble b2"></div>
+        <div class="bubble b3"></div>
+        <div class="bubble b4"></div>
+        <div class="dsp-idle-logo">⛽</div>
+      </div>
+      <div class="dsp-idle-txt">🧾 বিল তৈরির অপেক্ষায়...</div>
+      <div class="dsp-idle-sub">কাউন্টার থেকে QR আসলে এখানে দেখা যাবে</div>
+      <div class="dsp-idle-pulse"><span></span><span></span><span></span></div>
     </div>
 
     <div id="dsp-waiting" style="display:none">
@@ -576,6 +599,7 @@ tbody tr:hover{background:#f8fafc}
     </div>
   </div>
   <div class="wl-indicator" id="dsp-wl">🔆 Screen Awake</div>
+  <div id="fs-hint">⛶ Full Screen-এ ফিরতে স্ক্রিনে টাচ করুন</div>
 </div>
 
 <!-- ============================================================ -->
@@ -589,7 +613,7 @@ tbody tr:hover{background:#f8fafc}
       <div class="merchant-logo">⛽</div>
       <div>
         <h2 style="margin:0;font-size:20px;" id="hdr-merchant">{{ config.MERCHANT_NAME }}</h2>
-        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">UPI Auto-Verify Engine v4.0 · Dual Device</div>
+        <div style="font-size:12.5px;opacity:.85;margin-top:2px;">UPI Auto-Verify Engine v4.1 · Dual Device</div>
       </div>
     </div>
     <div class="badge-group">
@@ -617,13 +641,13 @@ tbody tr:hover{background:#f8fafc}
         </label>
         <label class="toggle-row">
           <input type="checkbox" id="security-toggle" {{ 'checked' if config.SECURITY_SWITCH else '' }}>
-          🚨 Security Switch — চার্জার খুললে অ্যালার্ম (PIN: লাগবে বন্ধ করতে)
+          🚨 Security Switch — চার্জার খুললে অ্যালার্ম (PIN লাগবে বন্ধ করতে)
         </label>
         <button class="btn dark" onclick="updateSettings()">💾 Save Settings</button>
         <button class="btn" style="background:#0d9488;margin-top:10px" onclick="window.open('/?mode=display','_blank')">🖥️ Open Customer Display (2nd Device)</button>
         <div style="margin-top:14px;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12.5px;color:var(--muted);line-height:1.6">
-          ℹ️ <b>দুই ডিভাইস সেটআপ:</b> এই ডিভাইস থেকে QR তৈরি করুন → কাস্টমারের সামনে রাখা ফোনে <b>?mode=display</b> লিংক খুলুন। ওখানে QR + Success অটো দেখাবে, touch লক থাকবে।<br>
-          🚨 <b>Security ON:</b> সাইট খোলা যেকোনো ডিভাইস চার্জার থেকে খুললে সাইরেন বাজবে। বন্ধ করতে ডিভাইসে PIN (<b id="pin-hint">****</b>) দিন বা এখানে switch OFF করুন।
+          ℹ️ <b>দুই ডিভাইস সেটআপ:</b> কাস্টমারের সামনে রাখা ফোনে <b>?mode=display</b> লিংক খুলুন → একবার টাচ করলেই Full Screen-এ চালু হবে। QR generate করলেই ওখানে animation সহ দেখাবে।<br>
+          🚨 <b>Security ON:</b> চার্জার থেকে ফোন খুললেই সাইরেন। বন্ধ করতে PIN (<b>1234</b>) দিন।
         </div>
       </div>
 
@@ -780,18 +804,15 @@ tbody tr:hover{background:#f8fafc}
 
 <script>
 /* ================================================================
-   MODE DETECT — ?mode=display হলে Customer Display ডিভাইস
+   MODE DETECT + SHARED UTILS (দুই মোডেই লাগবে)
 ================================================================ */
 const IS_DISPLAY = new URLSearchParams(location.search).get('mode') === 'display';
+const FS_SUPPORTED = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
 const el = id => document.getElementById(id);
 
-if(IS_DISPLAY){
-  document.body.classList.add('display-mode');
-}
+if(IS_DISPLAY){ document.body.classList.add('display-mode'); }
 
-/* ================================================================
-   🔆 WAKE LOCK — স্ক্রিন কখনো নিভবে না (দুই মোডেই)
-================================================================ */
+/* ---- 🔆 Wake Lock ---- */
 let wakeLock=null;
 async function requestWakeLock(){
   try{
@@ -805,9 +826,7 @@ document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible') requestWakeLock();
 });
 
-/* ================================================================
-   🔊 Audio Engine (success ding + alarm siren)
-================================================================ */
+/* ---- 🔊 Audio Engine ---- */
 let audioCtx=null;
 function getAudio(){
   try{
@@ -828,62 +847,65 @@ function playDing(){
     o.start(t0); o.stop(t0+0.4);
   });
 }
-/* 🚨 Siren — ফুল ভলিউম, লুপ */
-let alarmOsc=null, alarmGain=null, alarmLoop=null, vibLoop=null, alarmActive=false;
-function startSiren(){
+function playPop(){
   const ctx=getAudio(); if(!ctx) return;
-  alarmOsc=ctx.createOscillator(); alarmGain=ctx.createGain();
-  alarmOsc.type='sawtooth';
-  alarmGain.gain.value=1.0;   // ফুল ভলিউম
-  alarmOsc.connect(alarmGain); alarmGain.connect(ctx.destination);
-  alarmOsc.start();
-  let up=true;
-  alarmLoop=setInterval(()=>{
-    const t=ctx.currentTime;
-    alarmOsc.frequency.cancelScheduledValues(t);
-    alarmOsc.frequency.setValueAtTime(up?600:1300,t);
-    alarmOsc.frequency.linearRampToValueAtTime(up?1300:600,t+0.5);
-    up=!up;
-  },500);
-  // ভাইব্রেশন
-  if(navigator.vibrate){
-    vibLoop=setInterval(()=>navigator.vibrate([600,200,600,200,600]),2000);
-    navigator.vibrate([600,200,600]);
+  const o=ctx.createOscillator(),g=ctx.createGain();
+  o.type='triangle';
+  const t=ctx.currentTime;
+  o.frequency.setValueAtTime(300,t);
+  o.frequency.exponentialRampToValueAtTime(900,t+0.18);
+  g.gain.setValueAtTime(0.3,t);
+  g.gain.exponentialRampToValueAtTime(0.01,t+0.25);
+  o.connect(g); g.connect(ctx.destination);
+  o.start(t); o.stop(t+0.3);
+}
+
+/* ---- 🎉 Confetti (global — display mode-ও ব্যবহার করবে) ---- */
+function launchConfetti(){
+  const colors=['#2563eb','#16a34a','#f59e0b','#ef4444','#8b5cf6','#06b6d4'];
+  for(let i=0;i<70;i++){
+    const c=document.createElement('div');
+    c.className='confetti';
+    const size=6+Math.random()*8;
+    c.style.cssText=`left:${Math.random()*100}vw;width:${size}px;height:${size*(Math.random()>.5?1:.5)}px;background:${colors[i%colors.length]};border-radius:${Math.random()>.5?'50%':'2px'};animation:fall ${2+Math.random()*1.5}s linear forwards`;
+    document.body.appendChild(c);
+    setTimeout(()=>c.remove(),4000);
   }
 }
-function stopSiren(){
-  try{ if(alarmOsc){alarmOsc.stop(); alarmOsc.disconnect();} if(alarmGain)alarmGain.disconnect(); }catch(e){}
-  if(alarmLoop){clearInterval(alarmLoop); alarmLoop=null;}
-  if(vibLoop){clearInterval(vibLoop); navigator.vibrate(0); vibLoop=null;}
-  alarmOsc=alarmGain=null;
+
+/* ---- Count-up ---- */
+function countUp(elm,target){
+  const t0=performance.now(), dur=1000;
+  function step(t){
+    const p=Math.min((t-t0)/dur,1), e=1-Math.pow(1-p,3);
+    elm.textContent='₹'+(target*e).toFixed(2);
+    if(p<1)requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
 }
 
 /* ================================================================
-   🚨 SECURITY — চার্জার মনিটর (Battery API + সার্ভার switch)
+   🚨 SECURITY — চার্জার মনিটর (দুই ডিভাইসেই কাজ করে)
 ================================================================ */
-let battery=null, armedCharging=null, securityOn=false, lastServerAck=0, pinBuffer='';
+let battery=null, armedCharging=null, securityOn=false, lastServerAck=0, alarmActive=false, pinBuffer='';
 async function initBattery(){
   try{
     if(navigator.getBattery){
       battery = await navigator.getBattery();
       battery.addEventListener('chargingchange', secCheck);
-    }else{
-      const wl=el('dsp-wl'); if(wl && IS_DISPLAY) wl.innerText='⚠️ Security: Chrome/Android লাগবে';
     }
   }catch(e){}
 }
 async function secCheck(){
   try{
     const d = await fetch('/api/security').then(r=>r.json());
-    const wasOn = securityOn;
     securityOn = !!d.security;
-    // সার্ভার থেকে alarm-stop ack এলে বন্ধ
     if(d.ack > lastServerAck && alarmActive){ lastServerAck=d.ack; stopAlarm(); }
     if(!securityOn && alarmActive){ stopAlarm(); armedCharging=null; return; }
 
     if(!battery) return;
     if(securityOn){
-      if(armedCharging===null) armedCharging = battery.charging;  // baseline
+      if(armedCharging===null) armedCharging = battery.charging;
       if(armedCharging===true && !battery.charging && !alarmActive){
         triggerAlarm();
       }
@@ -903,6 +925,32 @@ function stopAlarm(){
   alarmActive=false;
   stopSiren();
   el('alarm-overlay').classList.remove('open');
+}
+function startSiren(){
+  const ctx=getAudio(); if(!ctx) return;
+  window._alarmOsc=ctx.createOscillator(); window._alarmGain=ctx.createGain();
+  window._alarmOsc.type='sawtooth';
+  window._alarmGain.gain.value=1.0;
+  window._alarmOsc.connect(window._alarmGain); window._alarmGain.connect(ctx.destination);
+  window._alarmOsc.start();
+  let up=true;
+  window._alarmLoop=setInterval(()=>{
+    const t=ctx.currentTime;
+    window._alarmOsc.frequency.cancelScheduledValues(t);
+    window._alarmOsc.frequency.setValueAtTime(up?600:1300,t);
+    window._alarmOsc.frequency.linearRampToValueAtTime(up?1300:600,t+0.5);
+    up=!up;
+  },500);
+  if(navigator.vibrate){
+    window._vibLoop=setInterval(()=>navigator.vibrate([600,200,600,200,600]),2000);
+    navigator.vibrate([600,200,600]);
+  }
+}
+function stopSiren(){
+  try{ if(window._alarmOsc){window._alarmOsc.stop(); window._alarmOsc.disconnect();} if(window._alarmGain)window._alarmGain.disconnect(); }catch(e){}
+  if(window._alarmLoop){clearInterval(window._alarmLoop); window._alarmLoop=null;}
+  if(window._vibLoop){clearInterval(window._vibLoop); navigator.vibrate(0); window._vibLoop=null;}
+  window._alarmOsc=window._alarmGain=null;
 }
 function renderPins(){
   const box=el('alarm-pins');
@@ -931,74 +979,100 @@ setInterval(secCheck, 2000);
 initBattery();
 
 /* ================================================================
-   Display Mode — Touch পুরোপুরি লক
+   🖥️ DISPLAY MODE — Touch Fix + Full Screen + Poll
 ================================================================ */
+let dspActivated=false;
+async function goFullscreen(){
+  try{
+    const docEl=document.documentElement;
+    if(docEl.requestFullscreen){ await docEl.requestFullscreen({navigationUI:'hide'}); }
+    else if(docEl.webkitRequestFullscreen){ await docEl.webkitRequestFullscreen(); }
+    if(screen.orientation && screen.orientation.lock){
+      screen.orientation.lock('portrait').catch(()=>{});
+    }
+  }catch(e){}
+}
+
 if(IS_DISPLAY){
+  /* ✅ FIX: activation-এর আগে কোনো preventDefault নেই — তাই টাচ কাজ করবে */
+  el('dsp-activate').addEventListener('pointerdown', function(){
+    if(dspActivated) return;
+    dspActivated=true;
+    el('dsp-activate').classList.add('hide');
+    getAudio();          // audio unlock (gesture-এর ভেতরে)
+    requestWakeLock();
+    goFullscreen();      // ⛶ সাথে সাথে Full Screen
+  });
+
+  /* Touch lock — শুধু activation-এর পরে; alarm PIN-এ টাচ allowed */
   document.addEventListener('touchstart', e=>{
-    if(!alarmActive) e.preventDefault();
+    if(!dspActivated) return;                 // activation screen: click যেন কাজ করে
+    if(alarmActive) return;                    // alarm PIN pad: টাচ allowed
+    e.preventDefault();                        // বাকি সব লক
+    if(FS_SUPPORTED && !document.fullscreenElement){
+      goFullscreen();                          // যেকোনো টাচে আবার fullscreen
+    }
   }, {passive:false});
-  document.addEventListener('touchmove', e=>e.preventDefault(), {passive:false});
-  document.addEventListener('dblclick', e=>e.preventDefault());
+  document.addEventListener('touchmove', e=>{
+    if(dspActivated && !alarmActive) e.preventDefault();
+  }, {passive:false});
+  document.addEventListener('dblclick', e=>{ if(dspActivated) e.preventDefault(); });
   document.addEventListener('contextmenu', e=>e.preventDefault());
 
-  // একবার টাচ → activate (wake lock + audio unlock) → এরপর লক
-  el('dsp-activate').addEventListener('click', function once(){
-    el('dsp-activate').classList.add('hide');
-    getAudio();
-    requestWakeLock();
-    secCheck();
+  /* Fullscreen বের হলে hint দেখাও */
+  document.addEventListener('fullscreenchange', ()=>{
+    const hint=el('fs-hint');
+    if(FS_SUPPORTED && dspActivated && !document.fullscreenElement && !alarmActive){
+      hint.style.display='block';
+      setTimeout(()=>{ hint.style.display='none'; }, 6000);
+    }else{
+      hint.style.display='none';
+    }
   });
-}
 
-/* ================================================================
-   Display Mode — Server state poll
-================================================================ */
-let lastSuccessShown=null;
-function dspCountUp(elm,target){
-  const t0=performance.now(), dur=1000;
-  function step(t){
-    const p=Math.min((t-t0)/dur,1), e=1-Math.pow(1-p,3);
-    elm.textContent='₹'+(target*e).toFixed(2);
-    if(p<1)requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-}
-function pollDisplay(){
-  fetch('/api/display_state').then(r=>r.json()).then(st=>{
-    el('dsp-merchant').innerText = st.merchant || 'BN Enterprises';
-    const scr=el('dsp-screen');
-    el('dsp-idle').style.display = st.mode==='idle'?'block':'none';
-    el('dsp-waiting').style.display = st.mode==='waiting'?'block':'none';
-    el('dsp-success').style.display = st.mode==='success'?'block':'none';
+  /* ---- Display State Poll ---- */
+  let prevMode='idle', prevOrderId=null;
+  function pollDisplay(){
+    fetch('/api/display_state').then(r=>r.json()).then(st=>{
+      el('dsp-merchant').innerText = st.merchant || 'BN Enterprises';
+      const scr=el('dsp-screen');
+      el('dsp-idle').style.display = st.mode==='idle'?'block':'none';
+      el('dsp-waiting').style.display = st.mode==='waiting'?'block':'none';
+      el('dsp-success').style.display = st.mode==='success'?'block':'none';
+      scr.className='dsp-screen '+(st.mode==='idle'?'idle':'');
 
-    scr.className='dsp-screen '+(st.mode==='idle'?'idle':'');
-
-    if(st.mode==='waiting'){
-      el('dsp-amount').innerText='₹'+Number(st.amount).toFixed(st.amount%1?2:0);
-      el('dsp-code').innerText=st.secret_code;
-      if(el('dsp-qr').dataset.oid!==st.order_id){
-        el('dsp-qr').innerHTML='';
-        el('dsp-qr').dataset.oid=st.order_id;
-        new QRCode(el('dsp-qr'),{text:st.upi_url,width:230,height:230,correctLevel:QRCode.CorrectLevel.M});
+      if(st.mode==='waiting'){
+        el('dsp-code').innerText=st.secret_code;
+        if(prevOrderId!==st.order_id){
+          el('dsp-qr').innerHTML='';
+          el('dsp-qr').dataset.oid=st.order_id;
+          prevOrderId=st.order_id;
+          new QRCode(el('dsp-qr'),{text:st.upi_url,width:230,height:230,correctLevel:QRCode.CorrectLevel.M});
+          /* 🎬 QR generate হওয়ার সাথে সাথে animation */
+          countUp(el('dsp-amount'), Number(st.amount));
+          playPop();
+          launchConfetti();
+        }
       }
-    }
 
-    if(st.mode==='success' && lastSuccessShown!==st.order_id){
-      lastSuccessShown=st.order_id;
-      el('dsp-payer').innerText = st.payer || 'Customer';
-      el('dsp-time').innerText = st.time || '';
-      dspCountUp(el('dsp-amt2'), Number(st.amount));
-      playDing(); launchConfetti();
-    }
-  }).catch(()=>{});
-}
-if(IS_DISPLAY){
-  setInterval(pollDisplay, 1500);
+      if(st.mode==='success' && prevOrderId!=='S'+st.order_id){
+        prevOrderId='S'+st.order_id;
+        el('dsp-payer').innerText = st.payer || 'Customer';
+        el('dsp-time').innerText = st.time || '';
+        countUp(el('dsp-amt2'), Number(st.amount));
+        playDing();
+        launchConfetti();
+      }
+      if(st.mode==='idle'){ prevOrderId=null; }
+      prevMode=st.mode;
+    }).catch(()=>{});
+  }
+  setInterval(pollDisplay, 1200);
   pollDisplay();
 }
 
 /* ================================================================
-   POS MODE — সব লজিক
+   ⛽ POS MODE
 ================================================================ */
 let pollTimer=null, timerInt=null, timeLeft=300, lastRecord=null, historyData=[], gmailOK=false, currentOrderId=null, statusFilter='ALL', currentReceiptRec=null;
 
@@ -1098,7 +1172,6 @@ if(!IS_DISPLAY){
       }).catch(()=>showToast('Order create failed!','error'));
   }
 
-  /* ⚡ দ্রুত polling (1.5s) — কারণ সার্ভার cache সবসময় fresh */
   function startPolling(orderId){
     stopPolling();
     timeLeft=300; updateTimer();
@@ -1160,33 +1233,12 @@ if(!IS_DISPLAY){
     loadStats(); loadHistory();
   }
 
-  function countUp(elm,target){
-    const t0=performance.now(), dur=1000;
-    function step(t){
-      const p=Math.min((t-t0)/dur,1), e=1-Math.pow(1-p,3);
-      elm.textContent='₹'+(target*e).toFixed(2);
-      if(p<1)requestAnimationFrame(step);
-    }
-    requestAnimationFrame(step);
-  }
-
   function blinkTitle(){
     let n=0;
     const t=setInterval(()=>{
       document.title = n%2===0 ? '✅ Payment Received!' : 'BN Enterprises - Fuel POS';
       if(++n>6){ clearInterval(t); document.title='BN Enterprises - Fuel POS'; }
     },600);
-  }
-  function launchConfetti(){
-    const colors=['#2563eb','#16a34a','#f59e0b','#ef4444','#8b5cf6','#06b6d4'];
-    for(let i=0;i<70;i++){
-      const c=document.createElement('div');
-      c.className='confetti';
-      const size=6+Math.random()*8;
-      c.style.cssText=`left:${Math.random()*100}vw;width:${size}px;height:${size*(Math.random()>.5?1:.5)}px;background:${colors[i%colors.length]};border-radius:${Math.random()>.5?'50%':'2px'};animation:fall ${2+Math.random()*1.5}s linear forwards`;
-      document.body.appendChild(c);
-      setTimeout(()=>c.remove(),4000);
-    }
   }
   function resetQRView(){
     stopPolling(); currentOrderId=null;
@@ -1345,7 +1397,6 @@ if(!IS_DISPLAY){
   /* Init POS */
   checkEmailStatus(); loadHistory(); loadStats(); validateAmount(); syncSecurityToggle();
   setInterval(()=>{ if(el('tab-dash').classList.contains('active')) loadStats(); },10000);
-  // প্রথম টাচে wake lock চালু (gesture requirement)
   document.addEventListener('pointerdown', function once(){ requestWakeLock(); document.removeEventListener('pointerdown',once); });
 }
 </script>
@@ -1376,7 +1427,6 @@ def api_update_settings():
         CONFIG["SECURITY_SWITCH"] = bool(data["security"])
     return jsonify({"status": "success", "message": "✅ Settings updated successfully!"})
 
-# ================= 🚨 Security APIs =================
 @app.route('/api/security')
 def api_security():
     return jsonify({"security": CONFIG["SECURITY_SWITCH"], "ack": ALARM_ACK})
@@ -1387,12 +1437,11 @@ def api_alarm_stop():
     data = request.json or {}
     pin = str(data.get("pin", ""))
     if pin == str(CONFIG["SECURITY_PIN"]):
-        CONFIG["SECURITY_SWITCH"] = False   # switch অটো OFF
+        CONFIG["SECURITY_SWITCH"] = False
         ALARM_ACK += 1
         return jsonify({"status": "ok", "ack": ALARM_ACK})
     return jsonify({"status": "error", "message": "ভুল PIN"}), 401
 
-# ================= 🖥️ Display Device State =================
 @app.route('/api/display_state')
 def api_display_state():
     cleanup_expired_orders()
@@ -1455,7 +1504,7 @@ def api_create_order():
         "status": "PENDING",
         "created_at": time.time()
     }
-    CURRENT_ORDER_ID = order_id   # 🆕 Display ডিভাইস সাথে সাথে দেখবে
+    CURRENT_ORDER_ID = order_id
     return jsonify({
         "order_id": order_id,
         "secret_code": code,
@@ -1465,7 +1514,6 @@ def api_create_order():
 
 @app.route('/api/verify_order')
 def api_verify_order():
-    global CURRENT_ORDER_ID
     order_id = request.args.get('order_id', '')
     if order_id not in ACTIVE_ORDERS:
         return jsonify({"status": "error", "message": "Order not found"}), 404
@@ -1579,7 +1627,6 @@ def api_export():
         headers={"Content-Disposition": "attachment; filename=transactions.csv"}
     )
 
-# ================= Debug =================
 @app.route('/api/debug/emails')
 def api_debug_emails():
     emails = get_recent_emails()
